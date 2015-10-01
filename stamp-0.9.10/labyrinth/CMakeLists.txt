@@ -16,7 +16,7 @@ set(
   ../lib/random.c
   ../lib/thread.c
   ../lib/vector.c
-  ../lib/controller.c
+  ../../bench/controller.c
   coordinate.c
   grid.c
   labyrinth.c

@@ -1,83 +1,32 @@
 /* =============================================================================
  *
- * client.c
- *
- * =============================================================================
- *
- * Copyright (C) Stanford University, 2006.  All Rights Reserved.
- * Author: Chi Cao Minh
- *
- * =============================================================================
- *
- * For the license of bayes/sort.h and bayes/sort.c, please see the header
- * of the files.
- *
- * ------------------------------------------------------------------------
- *
- * For the license of kmeans, please see kmeans/LICENSE.kmeans
- *
- * ------------------------------------------------------------------------
- *
- * For the license of ssca2, please see ssca2/COPYRIGHT
- *
- * ------------------------------------------------------------------------
- *
- * For the license of lib/mt19937ar.c and lib/mt19937ar.h, please see the
- * header of the files.
- *
- * ------------------------------------------------------------------------
- *
- * For the license of lib/rbtree.h and lib/rbtree.c, please see
- * lib/LEGALNOTICE.rbtree and lib/LICENSE.rbtree
- *
- * ------------------------------------------------------------------------
- *
- * Unless otherwise noted, the following license applies to STAMP files:
- *
- * Copyright (c) 2007, Stanford University
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
- *
- *     * Redistributions of source code must retain the above copyright
- *       notice, this list of conditions and the following disclaimer.
- *
- *     * Redistributions in binary form must reproduce the above copyright
- *       notice, this list of conditions and the following disclaimer in
- *       the documentation and/or other materials provided with the
- *       distribution.
- *
- *     * Neither the name of Stanford University nor the names of its
- *       contributors may be used to endorse or promote products derived
- *       from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY STANFORD UNIVERSITY ``AS IS'' AND ANY
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL STANFORD UNIVERSITY BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
- * THE POSSIBILITY OF SUCH DAMAGE.
+ * controller.c
  *
  * =============================================================================
  */
-
 
 #include <assert.h>
 #include <math.h>
 #include <time.h>
 #include "controller.h"
-#include "thread.h"
-#include "tm.h"
-#include "random.h"
+#include <pthread.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "types.h"
+
+#define MALLOC malloc
+#define FREE free
+
+const char *policies[3] = {"aimdp", "aimd", "aiad"};
+typedef enum {
+    aimdp = 0L,
+    aimd = 1L,
+    aiad = 2L
+} policy_t;
 
 extern volatile bool_t   global_isTerminated;
+extern volatile bool_t   global_timedExecution;
 
 long global_windowStart;
 long global_windowSize;
@@ -118,7 +67,6 @@ void controller_alloc(long numThreads)
     pthread_create(&controllerThread, &controller_attr, &controller, NULL);
 #endif
 }
-
 /* =============================================================================
  * controller_free
  * =============================================================================
@@ -127,13 +75,13 @@ void controller_alloc(long numThreads)
 void controller_free()
 {
 #ifdef CONTROLLER
+    pthread_join(controllerThread, NULL);
     for (long i = 1 ; i < global_numThreads ; i++)
     {
         SEM_DESTROY(global_metadata[i].semaphore);
     }
-    P_FREE(global_metadata);
+    FREE(global_metadata);
     global_metadata = NULL;
-    pthread_join(controllerThread, NULL);
  #endif
 }
 
@@ -147,6 +95,8 @@ void *controller(void* args)
     int phase = 0;
     long iterations = 0;
     double currentRate = 0;
+    double prevRate = 0;
+    double prevPrevRate = 0;
     double bestSloweddownRate = 0;
     int mdPhases = 0;
     int avoidedMdPhases = 0;
@@ -155,24 +105,22 @@ void *controller(void* args)
     unsigned long currentTotalThroughput = 0;
     unsigned long prevTotalThroughput = 0;
 
-    double *rateHistory = (double *)P_MALLOC(sizeof(double) * global_numThreads);
-    ulong *timeHistory = (ulong *)P_MALLOC(sizeof(ulong) * global_numThreads);
-    memset(rateHistory, 0, sizeof(double) * global_numThreads);
-    memset(timeHistory, 0, sizeof(ulong) * global_numThreads);
+    //double *rateHistory = (double *)MALLOC(sizeof(double) * global_numThreads);
+    //ulong *timeHistory = (ulong *)MALLOC(sizeof(ulong) * global_numThreads);
+    //memset(rateHistory, 0, sizeof(double) * global_numThreads);
+    //memset(timeHistory, 0, sizeof(ulong) * global_numThreads);
 
     double threadAvg = 0;
 
     int max = 0;
 
-    struct timespec rtStart, rtEnd, processStart, processEnd, timer ;
+    struct timespec rtStart, rtEnd, processStart, timer ;
 
-    int slowstart = 0;
     int slowdowns = 0;
     timer.tv_sec = 0;
-    timer.tv_nsec = 10 * 1000000L;
+    timer.tv_nsec = 10000000;
     char *envVar = getenv("CONTROLLER_TIMER");
     if (envVar)
-        //timer = atoi(envVar);
         timer.tv_nsec = atol(envVar) * 1000000L;
     float dConstant = 2;
     envVar = getenv("MD_CONSTANT");
@@ -184,14 +132,21 @@ void *controller(void* args)
     if (envVar)
         maxSlowdowns = atoi(envVar);
 
-    int controllerOutput = 0;
+    int controllerOutput = 1;
     envVar = getenv("CONTROLLER_OUTPUT");
     if (envVar)
         controllerOutput = atoi(envVar);
 
-    //random_t* ptrRandom = random_alloc();
-    //random_seed(ptrRandom, (ulong)pthread_self());
-
+    policy_t policy = aimdp;
+    envVar = getenv("CONTROLLER_POLICY");
+    if (envVar)
+    {
+        if (!strcasecmp(envVar, policies[aimd]))
+            policy = aimd;
+        else if (!strcasecmp(envVar, policies[aiad]))
+            policy = aiad;
+    }
+    printf("\nPolicy: %s\n", policies[policy]);
     while (!global_isTerminated && prevTotalThroughput == 0)
     {
         prevTotalThroughput = get_total_throughput();
@@ -203,24 +158,8 @@ void *controller(void* args)
     {
         nanosleep(&timer, NULL);
         clock_gettime(CLOCK_REALTIME, &rtEnd);
-//       clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processEnd);
         currentTotalThroughput = get_total_throughput();
         long actualDelay = (rtEnd.tv_sec - rtStart.tv_sec ) * 1000L + ( rtEnd.tv_nsec - rtStart.tv_nsec ) / 1000000L;
-//        long processTime = (processEnd.tv_sec - processStart.tv_sec ) * 1000L + ( processEnd.tv_nsec - processStart.tv_nsec ) / 1000000L;
-//        processStart = processEnd;
-//        if (processTime < (global_windowSize - 2) * (timer.tv_sec * 1000L + timer.tv_nsec / 1000000L))
-//        {
-//            printf("\r\n\%d",global_windowSize);
-//            global_windowSize = processTime / (timer.tv_sec * 1000L + timer.tv_nsec / 1000000L);
-//            printf("\r\n\%d\r\n",global_windowSize);
-//            memset(&rateHistory[global_windowSize - 1], 0 , sizeof(double) * (global_numThreads - global_windowSize + 1));
-//            prevTotalThroughput = 0;
-//            slowdowns = 0;
-//            phase = 0;
-//            fairnessPhases ++;
-//            rtStart = rtEnd;
-//            continue;
-//        }
         currentRate = (double)(currentTotalThroughput - prevTotalThroughput) / actualDelay;
         if ((currentTotalThroughput - prevTotalThroughput) == 0)
         {
@@ -232,10 +171,15 @@ void *controller(void* args)
         rtStart = rtEnd;
         prevTotalThroughput = currentTotalThroughput;
 
-        if (global_windowSize == 1 || currentRate > rateHistory[global_windowSize - 2])
+//        if (global_windowSize == 1 || currentRate > rateHistory[global_windowSize - 2])
+        if (global_windowSize == 1 || currentRate > prevRate)
         {
             if (phase == 0)
-                rateHistory[global_windowSize - 1] = currentRate;
+            {
+                //rateHistory[global_windowSize - 1] = currentRate;
+                //prevPrevRate = prevRate;
+                //prevRate = currentRate;
+            }
             else
                 avoidedMdPhases ++;
             phase = 0;
@@ -243,25 +187,19 @@ void *controller(void* args)
             bestSloweddownRate = 0;
             if (global_windowSize < global_numThreads)
             {
-//					if (slowstart)
-//					{
-//						slowstart = 0;
-//						global_windowSize *= 2;
-//						for (int j = 0 ; j < global_windowSize / 2 ; j++)
-//							pthread_cond_signal(&count_threshold_cv);
-//					}
-//					else
-//					{
-                    global_windowSize++;
-                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
-//					}
+                prevPrevRate = prevRate;
+                prevRate = currentRate;
+
+                global_windowSize++;
+                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
             }
         }
         else
         {
-            if (phase == 0)
+            if (phase == 0 && policy == aimdp)
             {
                 global_windowSize -= 1;
+                prevRate = prevPrevRate;
                 phase = 1;
             }
             else
@@ -270,10 +208,28 @@ void *controller(void* args)
                 slowdowns++;
                 if (slowdowns == maxSlowdowns)
                 {
-                    int newMax = floor((global_windowSize + 1)/dConstant);
-                    if (newMax == global_windowSize)
-                        newMax--;
-                    memset(&rateHistory[newMax - 1], 0 , sizeof(double) * (global_numThreads - newMax + 1));
+                    int newMax;
+                    if (policy == aimd || policy == aimdp)
+                    {
+//                        newMax = floor((global_windowSize + 1)/dConstant);
+//                        if (newMax == global_windowSize)
+//                            newMax--;
+//                        memset(&rateHistory[newMax - 1], 0 , sizeof(double) * (global_numThreads - newMax + 1));
+                        newMax = floor((global_windowSize + 1)/dConstant);
+                        if (newMax == global_windowSize)
+                            newMax--;
+                        prevRate = 0;
+                        prevPrevRate = 0;
+
+                    }
+                    else if (policy == aiad)
+                    {
+//                        newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
+//                        memset(&rateHistory[newMax - 1], 0 , sizeof(double) * (global_numThreads - newMax + 1));
+                        newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
+                        prevRate = 0;
+                        prevPrevRate = 0;
+                    }
                     global_windowSize = newMax;
                     phase = 0;
                     slowdowns = 0;
@@ -300,7 +256,7 @@ void *controller(void* args)
         process_output = atoi(envVar);
     if (process_output)
     {
-        printf("\r\nAverage thread-count = %.2f\r\n", threadAvg);
+        printf("\r\nThread-count = %.2f\r\n", threadAvg);
         printf("Fairness Phases = %d\r\n", fairnessPhases);
         printf("MD-Phases = %d\r\n", mdPhases);
         printf("Avoided MD-Phases = %d\r\n", avoidedMdPhases);
@@ -343,7 +299,7 @@ void wait_for_turn(long threadId)
  */
 void add_throughput(long threadId, long count)
 {
-#if CONTROLLER
+#ifdef CONTROLLER
     global_metadata[threadId].operations += count;
 #endif
 }
@@ -366,7 +322,7 @@ unsigned long get_total_throughput()
 
 
 /* =============================================================================
- * controller
+ * get_thread_time_micro
  * -- Gets the current thread's processing time in micro-seconds
  * =============================================================================
  */
@@ -391,6 +347,7 @@ ulong_t get_thread_time_micro()
  *
  * =============================================================================
  */
+
 
 
 

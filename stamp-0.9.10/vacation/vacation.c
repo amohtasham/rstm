@@ -87,7 +87,7 @@
 #include "tm.h"
 #include "types.h"
 #include "utility.h"
-#include "controller.h"
+#include "controller_proxy.h"
 
 #include <signal.h>
 

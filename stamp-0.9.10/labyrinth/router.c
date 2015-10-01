@@ -77,7 +77,7 @@
 #include "router.h"
 #include "tm.h"
 #include "vector.h"
-#include "controller.h"
+#include "controller_proxy.h"
 
 extern volatile bool_t   global_isTerminated;
 extern volatile bool_t   global_timedExecution;

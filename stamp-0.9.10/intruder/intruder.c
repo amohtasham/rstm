@@ -81,7 +81,7 @@
 #include "thread.h"
 #include "timer.h"
 #include "tm.h"
-#include "controller.h"
+#include "controller_proxy.h"
 
 #include <signal.h>
 

@@ -17,7 +17,7 @@ set(
   ../lib/rbtree.c
   ../lib/thread.c
   ../lib/vector.c
-  ../lib/controller.c
+  ../../bench/controller.c
   decoder.c
   detector.c
   dictionary.c

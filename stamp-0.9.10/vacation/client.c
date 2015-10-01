@@ -76,7 +76,7 @@
 #include "reservation.h"
 #include "thread.h"
 #include "types.h"
-#include "controller.h"
+#include "controller_proxy.h"
 #include <time.h>
 
 extern volatile bool_t   global_isTerminated;
@@ -206,7 +206,7 @@ client_run (void* argPtr)
                 //        transaction, so that it is reset on abort?
                 bool_t isFound = FALSE;
                 TM_BEGIN();
-                //beginTime = get_thread_time_micro();
+                beginTime = get_thread_time_micro();
                 for (n = 0; n < numQuery; n++) {
                     long t = types[n];
                     long id = ids[n];
@@ -252,7 +252,7 @@ client_run (void* argPtr)
                                          customerId, maxIds[RESERVATION_ROOM]);
                 }
                 TM_END();
-                //add_throughput(myId, get_thread_time_micro() - beginTime);
+                add_throughput(myId, get_thread_time_micro() - beginTime);
 
                 break;
             }
@@ -260,13 +260,13 @@ client_run (void* argPtr)
             case ACTION_DELETE_CUSTOMER: {
                 long customerId = random_generate(randomPtr) % queryRange + 1;
                 TM_BEGIN();
-                //beginTime = get_thread_time_micro();
+                beginTime = get_thread_time_micro();
                 long bill = MANAGER_QUERY_CUSTOMER_BILL(managerPtr, customerId);
                 if (bill >= 0) {
                     MANAGER_DELETE_CUSTOMER(managerPtr, customerId);
                 }
                 TM_END();
-                //add_throughput(myId, get_thread_time_micro() - beginTime);
+                add_throughput(myId, get_thread_time_micro() - beginTime);
                 break;
             }
 
@@ -282,7 +282,7 @@ client_run (void* argPtr)
                     }
                 }
                 TM_BEGIN();
-                //beginTime = get_thread_time_micro();
+                beginTime = get_thread_time_micro();
                 for (n = 0; n < numUpdate; n++) {
                     long t = types[n];
                     long id = ids[n];
@@ -319,7 +319,7 @@ client_run (void* argPtr)
                     }
                 }
                 TM_END();
-                //add_throughput(myId, get_thread_time_micro() - beginTime);
+                add_throughput(myId, get_thread_time_micro() - beginTime);
                 break;
             }
 
@@ -327,7 +327,7 @@ client_run (void* argPtr)
                 assert(0);
 
         } /* switch (action) */
-        add_throughput(myId, 1);
+        //add_throughput(myId, 1);
 
     } /* for i */
 

@@ -13,7 +13,7 @@ set(
   ../lib/mt19937ar.c
   ../lib/random.c
   ../lib/thread.c
-  ../lib/controller.c
+  ../../bench/controller.c
   client.c
   customer.c
   manager.c

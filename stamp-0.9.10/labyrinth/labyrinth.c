@@ -79,7 +79,7 @@
 #include "thread.h"
 #include "timer.h"
 #include "types.h"
-#include "controller.h"
+#include "controller_proxy.h"
 
 #include <signal.h>
 #include <time.h>
