@@ -19,6 +19,9 @@
 #define SEM_POST(sem)  sem_post(&sem)
 #define SEM_WAIT(sem)  sem_wait(&sem)
 
+#define MODIFIED_ZSCORE_CONSTANT 0.6745
+#define MODIFIED_ZSCORE_WINDOW_SIZE 3
+
 //64-byte = cache-line size
 typedef struct
 {
@@ -60,7 +63,7 @@ void wait_for_turn(long threadId);
  * -- Increases the operations counter
  * =============================================================================
  */
-void add_throughput(long threadId, long count);
+void add_throughput(long threadId, ulong_t count);
 
 /* =============================================================================
  * get_total_operations()
@@ -83,7 +86,7 @@ void *controller(void* args);
  * -- Gets the current thread's processing time in micro-seconds
  * =============================================================================
  */
-ulong_t get_thread_time_micro();
+ulong_t get_thread_time();
 
 
 #endif /* CONTROLLER_H */

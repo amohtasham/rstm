@@ -13,17 +13,51 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "types.h"
+#include "common/platform.hpp"
 
 #define MALLOC malloc
 #define FREE free
+//#define CONTROLLER
 
-const char *policies[3] = {"aimdp", "aimd", "aiad"};
+const char *policies[7] = {"none","aimdp", "aimd", "aiad", "aimdpp", "aiadpp", "cubic"};
 typedef enum {
-    aimdp = 0L,
-    aimd = 1L,
-    aiad = 2L
+    none = 0L,
+    aimdp = 1L,
+    aimd = 2L,
+    aiad = 3L,
+    aimdpp = 4L,
+    aiadpp = 5L,
+    cubic = 6L
 } policy_t;
+
+typedef struct {
+    unsigned long currentTotalThroughput;
+    unsigned long prevTotalThroughput;
+    int phase;
+    long iterations;
+    double currentRate;
+    double prevRate;
+    double prevPrevRate;
+    int mdPhases;
+    int avoidedMdPhases;
+    int fairnessPhases;
+    int slowdowns;
+    float dConstant;
+    int maxSlowdowns;
+    unsigned long actualDelay;
+    unsigned long processTime;
+
+} controller_params_t;
+
+
+void controller_aimd(controller_params_t &params);
+void controller_aiad(controller_params_t &params);
+void controller_aimdp(controller_params_t &params);
+void controller_aimdpp(controller_params_t &params);
+void controller_aiadpp(controller_params_t &params);
+void controller_cubic(controller_params_t &params);
 
 extern volatile bool_t   global_isTerminated;
 extern volatile bool_t   global_timedExecution;
@@ -31,17 +65,21 @@ extern volatile bool_t   global_timedExecution;
 long global_windowStart;
 long global_windowSize;
 long global_numThreads;
+long global_activeThreads;
 
 metadata_t* global_metadata;
 pthread_t controllerThread;
+
+
 
 /* =============================================================================
  * controller_alloc
  * =============================================================================
  */
+
 void controller_alloc(long numThreads)
 {
- #ifdef CONTROLLER
+#ifdef CONTROLLER
     posix_memalign((void **)&global_metadata, sizeof(metadata_t), sizeof(metadata_t) * numThreads);
     //semaphores = P_MALLOC(numThreads * sizeof(SEM_T));
     assert(global_metadata != NULL);
@@ -50,9 +88,10 @@ void controller_alloc(long numThreads)
         SEM_INIT(global_metadata[i].semaphore, 0);
         global_metadata[i].operations = 0;
     }
+
     global_windowStart = 0;
-    global_windowSize = 1;
     global_numThreads = numThreads;
+    global_activeThreads = numThreads;
 
     pthread_attr_t controller_attr;
     struct sched_param param;
@@ -82,7 +121,7 @@ void controller_free()
     }
     FREE(global_metadata);
     global_metadata = NULL;
- #endif
+#endif
 }
 
 /* =============================================================================
@@ -92,45 +131,28 @@ void controller_free()
  */
 void *controller(void* args)
 {
-    int phase = 0;
-    long iterations = 0;
-    double currentRate = 0;
-    double prevRate = 0;
-    double prevPrevRate = 0;
-    double bestSloweddownRate = 0;
-    int mdPhases = 0;
-    int avoidedMdPhases = 0;
-    int fairnessPhases = 0;
-
-    unsigned long currentTotalThroughput = 0;
-    unsigned long prevTotalThroughput = 0;
-
-    //double *rateHistory = (double *)MALLOC(sizeof(double) * global_numThreads);
-    //ulong *timeHistory = (ulong *)MALLOC(sizeof(ulong) * global_numThreads);
-    //memset(rateHistory, 0, sizeof(double) * global_numThreads);
-    //memset(timeHistory, 0, sizeof(ulong) * global_numThreads);
-
     double threadAvg = 0;
+    unsigned long  iterations = 0;
 
     int max = 0;
+    controller_params_t params;
 
-    struct timespec rtStart, rtEnd, processStart, timer ;
+    struct timespec rtStart, rtEnd, processStart, processEnd, timer ;
 
-    int slowdowns = 0;
     timer.tv_sec = 0;
-    timer.tv_nsec = 10000000;
+    timer.tv_nsec = 100000000; //100 milliseconds
     char *envVar = getenv("CONTROLLER_TIMER");
     if (envVar)
-        timer.tv_nsec = atol(envVar) * 1000000L;
-    float dConstant = 2;
+        timer.tv_nsec = atol(envVar) * 1000000L; // CONTROLLER_TIMER is in milliseconds
+    params.dConstant = 2;
     envVar = getenv("MD_CONSTANT");
     if (envVar)
-        dConstant = atof(envVar);
+        params.dConstant = atof(envVar);
 
-    int maxSlowdowns = 3;
+    params.maxSlowdowns = 3;
     envVar = getenv("MAX_SLOWDOWNS");
     if (envVar)
-        maxSlowdowns = atoi(envVar);
+        params.maxSlowdowns = atoi(envVar);
 
     int controllerOutput = 1;
     envVar = getenv("CONTROLLER_OUTPUT");
@@ -145,105 +167,91 @@ void *controller(void* args)
             policy = aimd;
         else if (!strcasecmp(envVar, policies[aiad]))
             policy = aiad;
+        else if (!strcasecmp(envVar, policies[aimdp]))
+            policy = aimdp;
+        else if (!strcasecmp(envVar, policies[aimdpp]))
+            policy = aimdpp;
+        else if (!strcasecmp(envVar, policies[aiadpp]))
+            policy = aiadpp;
+        else if (!strcasecmp(envVar, policies[cubic]))
+            policy = cubic;
+        else
+            policy = none;
     }
     printf("\nPolicy: %s\n", policies[policy]);
-    while (!global_isTerminated && prevTotalThroughput == 0)
+
+    global_windowSize = (policy == none)? global_numThreads: 1;
+
+
+    params.currentTotalThroughput = 0;
+    params.prevTotalThroughput = 0;
+    params.phase = 0;
+    params.currentRate = 0;
+    params.prevRate = 0;
+    params.prevPrevRate = 0;
+    params.mdPhases = 0;
+    params.avoidedMdPhases = 0;
+    params.fairnessPhases = 0;
+    params.slowdowns = 0;
+    while (global_windowSize != global_activeThreads && !global_isTerminated)
     {
-        prevTotalThroughput = get_total_throughput();
+        //if (controllerOutput)
+        //printf("wnd = %ld   #threads = %ld\r\n",global_windowSize,global_activeThreads);
+        usleep(1);
     }
-    int timerExtensions = 0;
-    clock_gettime(CLOCK_REALTIME, &rtStart);
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processStart);
+    while (!global_isTerminated && params.prevTotalThroughput == 0)
+    {
+        params.prevTotalThroughput = get_total_throughput();
+    }
+
+    //clock_gettime(CLOCK_REALTIME, &rtStart);
+    //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processStart);
     while (!global_isTerminated)
     {
+        params.prevTotalThroughput = get_total_throughput();
+        clock_gettime(CLOCK_REALTIME, &rtStart);
         nanosleep(&timer, NULL);
         clock_gettime(CLOCK_REALTIME, &rtEnd);
-        currentTotalThroughput = get_total_throughput();
-        long actualDelay = (rtEnd.tv_sec - rtStart.tv_sec ) * 1000L + ( rtEnd.tv_nsec - rtStart.tv_nsec ) / 1000000L;
-        currentRate = (double)(currentTotalThroughput - prevTotalThroughput) / actualDelay;
-        if ((currentTotalThroughput - prevTotalThroughput) == 0)
-        {
-            timerExtensions ++;
-            if (timerExtensions < 0)
-                continue;
+        //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processEnd);
+        params.currentTotalThroughput = get_total_throughput();
+        params.actualDelay = (rtEnd.tv_sec - rtStart.tv_sec ) * 1000L + ( rtEnd.tv_nsec - rtStart.tv_nsec ) / 1000000L;
+        //params.processTime = (processEnd.tv_sec - processStart.tv_sec ) * 1000L + ( processEnd.tv_nsec - processStart.tv_nsec ) / 1000000L;
+        params.currentRate = (double)(params.currentTotalThroughput - params.prevTotalThroughput) / params.actualDelay;
+        //rtStart = rtEnd;
+        //processStart = processEnd;
+        //params.prevTotalThroughput = params.currentTotalThroughput;
+
+        switch (policy) {
+        case aimd:
+            controller_aimd(params);
+            break;
+        case aimdp:
+            controller_aimdp(params);
+            break;
+        case aiad:
+            controller_aiad(params);
+            break;
+        case aimdpp:
+            controller_aimdpp(params);
+            break;
+        case cubic:
+            controller_cubic(params);
+            break;
+        default:
+            break;
         }
-        timerExtensions = 0;
-        rtStart = rtEnd;
-        prevTotalThroughput = currentTotalThroughput;
 
-//        if (global_windowSize == 1 || currentRate > rateHistory[global_windowSize - 2])
-        if (global_windowSize == 1 || currentRate > prevRate)
-        {
-            if (phase == 0)
-            {
-                //rateHistory[global_windowSize - 1] = currentRate;
-                //prevPrevRate = prevRate;
-                //prevRate = currentRate;
-            }
-            else
-                avoidedMdPhases ++;
-            phase = 0;
-            slowdowns = 0;
-            bestSloweddownRate = 0;
-            if (global_windowSize < global_numThreads)
-            {
-                prevPrevRate = prevRate;
-                prevRate = currentRate;
-
-                global_windowSize++;
-                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
-            }
-        }
-        else
-        {
-            if (phase == 0 && policy == aimdp)
-            {
-                global_windowSize -= 1;
-                prevRate = prevPrevRate;
-                phase = 1;
-            }
-            else
-            {
-                bestSloweddownRate = bestSloweddownRate < currentRate? currentRate: bestSloweddownRate;
-                slowdowns++;
-                if (slowdowns == maxSlowdowns)
-                {
-                    int newMax;
-                    if (policy == aimd || policy == aimdp)
-                    {
-//                        newMax = floor((global_windowSize + 1)/dConstant);
-//                        if (newMax == global_windowSize)
-//                            newMax--;
-//                        memset(&rateHistory[newMax - 1], 0 , sizeof(double) * (global_numThreads - newMax + 1));
-                        newMax = floor((global_windowSize + 1)/dConstant);
-                        if (newMax == global_windowSize)
-                            newMax--;
-                        prevRate = 0;
-                        prevPrevRate = 0;
-
-                    }
-                    else if (policy == aiad)
-                    {
-//                        newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
-//                        memset(&rateHistory[newMax - 1], 0 , sizeof(double) * (global_numThreads - newMax + 1));
-                        newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
-                        prevRate = 0;
-                        prevPrevRate = 0;
-                    }
-                    global_windowSize = newMax;
-                    phase = 0;
-                    slowdowns = 0;
-                    bestSloweddownRate = 0;
-                    mdPhases++;
-                }
-            }
-
-        }
         if (controllerOutput)
-            printf("%lu;%ld;%ld;%.2f \r\n", rtEnd.tv_sec * 1000000000L + rtEnd.tv_nsec, global_windowStart, global_windowSize, currentRate);
+            printf("%lu;%ld;%ld;%.2f \r\n", rtEnd.tv_sec * 1000000000L + rtEnd.tv_nsec, global_windowStart, global_windowSize, params.currentRate);
         iterations++;
         threadAvg = (threadAvg * (iterations-1) + global_windowSize)/(double)iterations;
         max = max >= global_windowSize? max : global_windowSize;
+        while (global_windowSize != global_activeThreads && !global_isTerminated)
+        {
+            //if (controllerOutput)
+            //printf("wnd = %ld   #threads = %ld\r\n",global_windowSize,global_activeThreads);
+            usleep(1);
+        };
     }
     //ublocking all threads
     long tid;
@@ -257,13 +265,261 @@ void *controller(void* args)
     if (process_output)
     {
         printf("\r\nThread-count = %.2f\r\n", threadAvg);
-        printf("Fairness Phases = %d\r\n", fairnessPhases);
-        printf("MD-Phases = %d\r\n", mdPhases);
-        printf("Avoided MD-Phases = %d\r\n", avoidedMdPhases);
+        printf("Fairness Phases = %d\r\n", params.fairnessPhases);
+        printf("MD-Phases = %d\r\n", params.mdPhases);
+        printf("Avoided MD-Phases = %d\r\n", params.avoidedMdPhases);
     }
     pthread_exit(NULL);
 }
 
+
+void controller_aimd(controller_params_t &params)
+{
+    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    {
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevRate = params.currentRate;
+
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        params.slowdowns++;
+        if (params.slowdowns == params.maxSlowdowns)
+        {
+            int newMax;
+            newMax = floor((global_windowSize + 1)/params.dConstant);
+            if (newMax == global_windowSize)
+                newMax--;
+            params.prevRate = 0;
+            global_windowSize = newMax;
+            params.slowdowns = 0;
+            params.mdPhases++;
+        }
+    }
+}
+
+void controller_aimdp(controller_params_t &params)
+{
+    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    {
+        if (params.phase != 0)
+            params.avoidedMdPhases ++;
+        params.phase = 0;
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevPrevRate = params.prevRate;
+            params.prevRate = params.currentRate;
+
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        if (params.phase == 0)
+        {
+            global_windowSize -= 1;
+            params.prevRate = params.prevPrevRate;
+            params.phase = 1;
+        }
+        else
+        {
+            params.slowdowns++;
+            if (params.slowdowns == params.maxSlowdowns)
+            {
+                int newMax;
+                newMax = floor((global_windowSize + 1)/params.dConstant);
+                if (newMax == global_windowSize)
+                    newMax--;
+                params.prevRate = 0;
+                params.prevPrevRate = 0;
+                global_windowSize = newMax;
+                params.phase = 0;
+                params.slowdowns = 0;
+                params.mdPhases++;
+            }
+        }
+
+    }
+}
+
+void controller_aimdpp(controller_params_t &params)
+{
+    if ((global_windowSize > 1) && (params.actualDelay * (global_windowSize - 1) > params.processTime))
+    {
+        //the system is oversubscribed
+        global_windowSize = (long)floor((double)params.processTime / (double)params.actualDelay);
+        params.phase = 0;
+        params.prevRate = 0;
+        params.prevPrevRate = 0;
+        params.phase = 0;
+        params.slowdowns = 0;
+    }
+    else if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    {
+        if (params.phase != 0)
+            params.avoidedMdPhases ++;
+        params.phase = 0;
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevPrevRate = params.prevRate;
+            params.prevRate = params.currentRate;
+
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        if (params.phase == 0)
+        {
+            global_windowSize -= 1;
+            params.prevRate = params.prevPrevRate;
+            params.phase = 1;
+        }
+        else
+        {
+            params.slowdowns++;
+            if (params.slowdowns == params.maxSlowdowns)
+            {
+                int newMax;
+                newMax = floor((global_windowSize + 1)/params.dConstant);
+                if (newMax == global_windowSize)
+                    newMax--;
+                params.prevRate = 0;
+                params.prevPrevRate = 0;
+                global_windowSize = newMax;
+                params.phase = 0;
+                params.slowdowns = 0;
+                params.mdPhases++;
+            }
+        }
+
+    }
+}
+
+void controller_aiad(controller_params_t &params)
+{
+
+    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    {
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevRate = params.currentRate;
+
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        params.slowdowns++;
+        if (params.slowdowns == params.maxSlowdowns)
+        {
+            int newMax;
+            newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
+            params.prevRate = 0;
+            global_windowSize = newMax;
+            params.phase = 0;
+            params.slowdowns = 0;
+        }
+    }
+}
+
+void controller_aiadpp(controller_params_t &params)
+{
+    if ((global_windowSize > 1) && (params.actualDelay * (global_windowSize - 1) > params.processTime))
+    {
+        //the system is oversubscribed
+        global_windowSize = (long)floor((double)params.processTime / (double)params.actualDelay);
+        params.phase = 0;
+        params.prevRate = 0;
+        params.prevPrevRate = 0;
+        params.phase = 0;
+        params.slowdowns = 0;
+    }
+    else if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    {
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevRate = params.currentRate;
+
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        params.slowdowns++;
+        if (params.slowdowns == params.maxSlowdowns)
+        {
+            int newMax;
+            newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
+            params.prevRate = 0;
+            global_windowSize = newMax;
+            params.phase = 0;
+            params.slowdowns = 0;
+        }
+    }
+}
+
+void controller_cubic(controller_params_t &params)
+{
+    static double b = 0.8;
+    static double a = 3 * (1 - b) / (1 + b);
+    static double c = 0.4;
+    static long t_increase = 0;
+    static double w_max = global_numThreads;
+
+    double w_tcp, w_cubic;
+
+    if (global_windowSize == 1 || params.currentRate >= params.prevRate)
+    {
+        t_increase++;
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            params.prevRate = params.currentRate;
+
+            w_tcp = (w_max * b) + (a * t_increase);
+            w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+            long newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+            while (global_windowSize < newSize)
+            {
+                global_windowSize++;
+                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+            }
+        }
+    }
+    else
+    {
+        params.slowdowns++;
+        if (params.slowdowns == params.maxSlowdowns)
+        {
+            w_max = global_windowSize;
+            t_increase = 0;
+            w_tcp = (w_max * b) + (a * t_increase);
+            w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+            long newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+
+            if (newSize == global_windowSize)
+                newSize--;
+            params.prevRate = 0;
+            global_windowSize = newSize;
+            params.slowdowns = 0;
+            params.mdPhases++;
+        }
+    }
+}
 
 /* =============================================================================
  * wait_for_turn
@@ -279,15 +535,17 @@ void wait_for_turn(long threadId)
     if ((windowEnd >= windowStart && (threadId < windowStart || threadId > windowEnd)) ||
             (windowEnd < windowStart && threadId < windowStart && threadId > windowEnd))
     {
+        __sync_fetch_and_sub(&global_activeThreads, 1);
         SEM_WAIT(global_metadata[threadId].semaphore);
-//			pthread_mutex_lock(&count_mutex);
-//			if (thread_count > global_windowSize)
-//			{
-//				thread_count--;
-//				pthread_cond_wait(&count_threshold_cv, &count_mutex);
-//				thread_count++;
-//			}
-//			pthread_mutex_unlock(&count_mutex);
+        __sync_fetch_and_add(&global_activeThreads, 1);
+        //			pthread_mutex_lock(&count_mutex);
+        //			if (thread_count > global_windowSize)
+        //			{
+        //				thread_count--;
+        //				pthread_cond_wait(&count_threshold_cv, &count_mutex);
+        //				thread_count++;
+        //			}
+        //			pthread_mutex_unlock(&count_mutex);
     }
 #endif
 }
@@ -297,7 +555,7 @@ void wait_for_turn(long threadId)
  * -- Increases the operations counter
  * =============================================================================
  */
-void add_throughput(long threadId, long count)
+void add_throughput(long threadId, ulong_t count)
 {
 #ifdef CONTROLLER
     global_metadata[threadId].operations += count;
@@ -309,9 +567,9 @@ void add_throughput(long threadId, long count)
  * -- Returns the total number of finished operations (TXs, tasks, etc.)
  * =============================================================================
  */
-unsigned long get_total_throughput()
+ulong_t get_total_throughput()
 {
-    unsigned long result = 0;
+    ulong_t result = 0;
     long i;
     for (i = 0 ; i < global_numThreads ; i++)
     {
@@ -326,10 +584,10 @@ unsigned long get_total_throughput()
  * -- Gets the current thread's processing time in micro-seconds
  * =============================================================================
  */
-ulong_t get_thread_time_micro()
+ulong_t get_thread_time()
 {
-#if CONTROLLER
     //return tick();
+#if CONTROLLER
     struct timespec timeSpec;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &timeSpec);
     return (timeSpec.tv_sec * 1000000L) + (timeSpec.tv_nsec / 1000L);

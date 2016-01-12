@@ -389,14 +389,15 @@ router_solve (void* argPtr)
     ulong_t beginTime;
     pair_t* coordinatePairPtr;
     TM_BEGIN();
-    beginTime = get_thread_time_micro();
+    beginTime = get_thread_time();
     if (TMQUEUE_ISEMPTY(workQueuePtr)) {
-      coordinatePairPtr = NULL;
+        if (TMQUEUE_ISEMPTY(workQueuePtr))
+            coordinatePairPtr = NULL;
     } else {
       coordinatePairPtr = (pair_t*)TMQUEUE_POP(workQueuePtr);
     }
     TM_END();
-    add_throughput(threadId , get_thread_time_micro() - beginTime);
+    //add_throughput(threadId , get_thread_time() - beginTime);
     if (coordinatePairPtr == NULL) {
       break;
     }
@@ -408,7 +409,7 @@ router_solve (void* argPtr)
     vector_t* pointVectorPtr = NULL;
 
     TM_BEGIN();
-    beginTime = get_thread_time_micro();
+    beginTime = get_thread_time();
     grid_copy(myGridPtr, gridPtr); /* ok if not most up-to-date */
     if (PdoExpansion(routerPtr, myGridPtr, myExpansionQueuePtr,
                      srcPtr, dstPtr)) {
@@ -424,7 +425,7 @@ router_solve (void* argPtr)
       }
     }
     TM_END();
-    add_throughput(threadId , get_thread_time_micro() - beginTime);
+    add_throughput(threadId , get_thread_time() - beginTime);
 
     numPath++;
     if (success) {
