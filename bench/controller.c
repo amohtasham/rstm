@@ -608,7 +608,7 @@ void controller_cubicp(controller_params_t &params)
     {
         if (params.phase != 0)
         {
-            params.avoidedMdPhases ++;
+            params.avoidedMdPhases++;
             params.phase = 0;
         }
         params.slowdowns = 0;
