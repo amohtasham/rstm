@@ -21,7 +21,7 @@
 #define FREE free
 //#define CONTROLLER
 
-const char *policies[7] = {"none","aimdp", "aimd", "aiad", "aimdpp", "aiadpp", "cubic"};
+const char *policies[9] = {"none","aimdp", "aimd", "aiad", "aimdpp", "aiadpp", "cubic","cubicp","f2c2"};
 typedef enum {
     none = 0L,
     aimdp = 1L,
@@ -29,7 +29,9 @@ typedef enum {
     aiad = 3L,
     aimdpp = 4L,
     aiadpp = 5L,
-    cubic = 6L
+    cubic = 6L,
+    cubicp = 7L,
+    f2c2 = 8L
 } policy_t;
 
 typedef struct {
@@ -38,8 +40,6 @@ typedef struct {
     int phase;
     long iterations;
     double currentRate;
-    double prevRate;
-    double prevPrevRate;
     int mdPhases;
     int avoidedMdPhases;
     int fairnessPhases;
@@ -58,6 +58,8 @@ void controller_aimdp(controller_params_t &params);
 void controller_aimdpp(controller_params_t &params);
 void controller_aiadpp(controller_params_t &params);
 void controller_cubic(controller_params_t &params);
+void controller_cubicp(controller_params_t &params);
+void controller_f2c2(controller_params_t &params);
 
 extern volatile bool_t   global_isTerminated;
 extern volatile bool_t   global_timedExecution;
@@ -175,6 +177,8 @@ void *controller(void* args)
             policy = aiadpp;
         else if (!strcasecmp(envVar, policies[cubic]))
             policy = cubic;
+        else if (!strcasecmp(envVar, policies[f2c2]))
+            policy = f2c2;
         else
             policy = none;
     }
@@ -185,10 +189,7 @@ void *controller(void* args)
 
     params.currentTotalThroughput = 0;
     params.prevTotalThroughput = 0;
-    params.phase = 0;
     params.currentRate = 0;
-    params.prevRate = 0;
-    params.prevPrevRate = 0;
     params.mdPhases = 0;
     params.avoidedMdPhases = 0;
     params.fairnessPhases = 0;
@@ -220,6 +221,8 @@ void *controller(void* args)
         //rtStart = rtEnd;
         //processStart = processEnd;
         //params.prevTotalThroughput = params.currentTotalThroughput;
+        if (controllerOutput)
+            printf("%lu;%ld;%ld;%.2f \r\n", rtEnd.tv_sec * 1000000000L + rtEnd.tv_nsec, global_windowStart, global_windowSize, params.currentRate);
 
         switch (policy) {
         case aimd:
@@ -237,12 +240,16 @@ void *controller(void* args)
         case cubic:
             controller_cubic(params);
             break;
+        case cubicp:
+            controller_cubic(params);
+            break;
+        case f2c2:
+            controller_f2c2(params);
+            break;
         default:
             break;
         }
 
-        if (controllerOutput)
-            printf("%lu;%ld;%ld;%.2f \r\n", rtEnd.tv_sec * 1000000000L + rtEnd.tv_nsec, global_windowStart, global_windowSize, params.currentRate);
         iterations++;
         threadAvg = (threadAvg * (iterations-1) + global_windowSize)/(double)iterations;
         max = max >= global_windowSize? max : global_windowSize;
@@ -275,15 +282,29 @@ void *controller(void* args)
 
 void controller_aimd(controller_params_t &params)
 {
-    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    static long slowStart = 1;
+    static double prevRate = 0;
+    long newSize = global_windowSize;
+
+    if (global_windowSize == 1 || params.currentRate > prevRate)
     {
         params.slowdowns = 0;
-        if (global_windowSize < global_numThreads)
+        if (slowStart)
         {
-            params.prevRate = params.currentRate;
-
+            newSize = fmin(global_windowSize * 2, global_numThreads);
+        }
+        else
+        {
+            newSize = fmin(global_windowSize + 1, global_numThreads);
+        }
+        while (global_windowSize < newSize)
+        {
             global_windowSize++;
             SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+        if (global_windowSize < global_numThreads)
+        {
+            prevRate = params.currentRate;
         }
     }
     else
@@ -291,13 +312,13 @@ void controller_aimd(controller_params_t &params)
         params.slowdowns++;
         if (params.slowdowns == params.maxSlowdowns)
         {
-            int newMax;
-            newMax = floor((global_windowSize + 1)/params.dConstant);
-            if (newMax == global_windowSize)
-                newMax--;
-            params.prevRate = 0;
-            global_windowSize = newMax;
+            newSize = floor((global_windowSize + 1)/params.dConstant);
+            if (newSize == global_windowSize)
+                newSize--;
+            prevRate = 0;
+            global_windowSize = newSize;
             params.slowdowns = 0;
+            slowStart = 0;
             params.mdPhases++;
         }
     }
@@ -305,27 +326,45 @@ void controller_aimd(controller_params_t &params)
 
 void controller_aimdp(controller_params_t &params)
 {
-    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    static long slowStart = 1;
+    static double prevRate = 0;
+    static double prevPrevRate = 0;
+
+    long newSize = global_windowSize;
+    if (global_windowSize == 1 || params.currentRate > prevRate)
     {
         if (params.phase != 0)
-            params.avoidedMdPhases ++;
-        params.phase = 0;
-        params.slowdowns = 0;
-        if (global_windowSize < global_numThreads)
         {
-            params.prevPrevRate = params.prevRate;
-            params.prevRate = params.currentRate;
-
-            global_windowSize++;
-            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+            params.avoidedMdPhases ++;
+            params.phase = 0;
         }
+        params.slowdowns = 0;
+        if (slowStart)
+        {
+            newSize = fmin(global_windowSize * 2, global_numThreads);
+        }
+        else
+        {
+            newSize = fmin(global_windowSize + 1, global_numThreads);
+        }
+        if (global_windowSize < newSize)
+        {
+            prevPrevRate = prevRate;
+            prevRate = params.currentRate;
+            while (global_windowSize < newSize)
+            {
+                global_windowSize++;
+                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+            }
+        }
+
     }
     else
     {
-        if (params.phase == 0)
+        if (params.phase == 0 && !slowStart)
         {
             global_windowSize -= 1;
-            params.prevRate = params.prevPrevRate;
+            prevRate = prevPrevRate;
             params.phase = 1;
         }
         else
@@ -333,16 +372,15 @@ void controller_aimdp(controller_params_t &params)
             params.slowdowns++;
             if (params.slowdowns == params.maxSlowdowns)
             {
-                int newMax;
-                newMax = floor((global_windowSize + 1)/params.dConstant);
-                if (newMax == global_windowSize)
-                    newMax--;
-                params.prevRate = 0;
-                params.prevPrevRate = 0;
-                global_windowSize = newMax;
+                newSize = fmax(fmin(floor((global_windowSize + 1)/params.dConstant), global_windowSize - 1),1);
+                prevRate = 0;
+                prevPrevRate = 0;
+                global_windowSize = newSize;
                 params.phase = 0;
                 params.slowdowns = 0;
                 params.mdPhases++;
+                if (slowStart)
+                    slowStart = 0;
             }
         }
 
@@ -351,17 +389,19 @@ void controller_aimdp(controller_params_t &params)
 
 void controller_aimdpp(controller_params_t &params)
 {
+    static double prevRate = 0;
+    static double prevPrevRate = 0;
     if ((global_windowSize > 1) && (params.actualDelay * (global_windowSize - 1) > params.processTime))
     {
         //the system is oversubscribed
         global_windowSize = (long)floor((double)params.processTime / (double)params.actualDelay);
         params.phase = 0;
-        params.prevRate = 0;
-        params.prevPrevRate = 0;
+        prevRate = 0;
+        prevPrevRate = 0;
         params.phase = 0;
         params.slowdowns = 0;
     }
-    else if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    else if (global_windowSize == 1 || params.currentRate > prevRate)
     {
         if (params.phase != 0)
             params.avoidedMdPhases ++;
@@ -369,8 +409,8 @@ void controller_aimdpp(controller_params_t &params)
         params.slowdowns = 0;
         if (global_windowSize < global_numThreads)
         {
-            params.prevPrevRate = params.prevRate;
-            params.prevRate = params.currentRate;
+            prevPrevRate = prevRate;
+            prevRate = params.currentRate;
 
             global_windowSize++;
             SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
@@ -381,7 +421,7 @@ void controller_aimdpp(controller_params_t &params)
         if (params.phase == 0)
         {
             global_windowSize -= 1;
-            params.prevRate = params.prevPrevRate;
+            prevRate = prevPrevRate;
             params.phase = 1;
         }
         else
@@ -393,8 +433,8 @@ void controller_aimdpp(controller_params_t &params)
                 newMax = floor((global_windowSize + 1)/params.dConstant);
                 if (newMax == global_windowSize)
                     newMax--;
-                params.prevRate = 0;
-                params.prevPrevRate = 0;
+                prevRate = 0;
+                prevPrevRate = 0;
                 global_windowSize = newMax;
                 params.phase = 0;
                 params.slowdowns = 0;
@@ -407,13 +447,13 @@ void controller_aimdpp(controller_params_t &params)
 
 void controller_aiad(controller_params_t &params)
 {
-
-    if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    static double prevRate = 0;
+    if (global_windowSize == 1 || params.currentRate > prevRate)
     {
         params.slowdowns = 0;
         if (global_windowSize < global_numThreads)
         {
-            params.prevRate = params.currentRate;
+            prevRate = params.currentRate;
 
             global_windowSize++;
             SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
@@ -426,7 +466,7 @@ void controller_aiad(controller_params_t &params)
         {
             int newMax;
             newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
-            params.prevRate = 0;
+            prevRate = 0;
             global_windowSize = newMax;
             params.phase = 0;
             params.slowdowns = 0;
@@ -436,22 +476,25 @@ void controller_aiad(controller_params_t &params)
 
 void controller_aiadpp(controller_params_t &params)
 {
+    static double prevRate = 0;
+    static double prevPrevRate = 0;
+
     if ((global_windowSize > 1) && (params.actualDelay * (global_windowSize - 1) > params.processTime))
     {
         //the system is oversubscribed
         global_windowSize = (long)floor((double)params.processTime / (double)params.actualDelay);
         params.phase = 0;
-        params.prevRate = 0;
-        params.prevPrevRate = 0;
+        prevRate = 0;
+        prevPrevRate = 0;
         params.phase = 0;
         params.slowdowns = 0;
     }
-    else if (global_windowSize == 1 || params.currentRate > params.prevRate)
+    else if (global_windowSize == 1 || params.currentRate > prevRate)
     {
         params.slowdowns = 0;
         if (global_windowSize < global_numThreads)
         {
-            params.prevRate = params.currentRate;
+            prevRate = params.currentRate;
 
             global_windowSize++;
             SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
@@ -464,7 +507,7 @@ void controller_aiadpp(controller_params_t &params)
         {
             int newMax;
             newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
-            params.prevRate = 0;
+            prevRate = 0;
             global_windowSize = newMax;
             params.phase = 0;
             params.slowdowns = 0;
@@ -479,24 +522,48 @@ void controller_cubic(controller_params_t &params)
     static double c = 0.4;
     static long t_increase = 0;
     static double w_max = global_numThreads;
+    static long slowStart = 1;
+    static long cubicIncrease = 1;
+    static double prevRate = 0;
 
     double w_tcp, w_cubic;
-
-    if (global_windowSize == 1 || params.currentRate >= params.prevRate)
+    long newSize = global_windowSize;
+    if (global_windowSize == 1 || params.currentRate >= prevRate)
     {
-        t_increase++;
         params.slowdowns = 0;
         if (global_windowSize < global_numThreads)
         {
-            params.prevRate = params.currentRate;
-
-            w_tcp = (w_max * b) + (a * t_increase);
-            w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-            long newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-            while (global_windowSize < newSize)
+            if (slowStart)
             {
-                global_windowSize++;
-                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+                newSize = fmin(global_windowSize * 2, global_numThreads);
+            }
+            else if (cubicIncrease)
+            {
+                //printf("Cubic\n");
+                t_increase++;
+                w_tcp = (w_max * b) + (a * t_increase);
+                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+                newSize = (newSize == global_windowSize)||(newSize >= w_max)? global_windowSize + 1: newSize;
+                if (newSize - global_windowSize > 1)
+                {
+                    cubicIncrease = 0;
+                }
+            }
+            else if (!cubicIncrease)
+            {
+                //printf("NonCubic\n");
+                newSize = fmin(global_windowSize + 1, global_numThreads);
+                cubicIncrease = 1;
+            }
+            if (newSize > global_windowSize)
+            {
+                while (global_windowSize < newSize)
+                {
+                    global_windowSize++;
+                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+                }
+                prevRate = params.currentRate;
             }
         }
     }
@@ -505,21 +572,175 @@ void controller_cubic(controller_params_t &params)
         params.slowdowns++;
         if (params.slowdowns == params.maxSlowdowns)
         {
+            slowStart = 0;
             w_max = global_windowSize;
             t_increase = 0;
             w_tcp = (w_max * b) + (a * t_increase);
             w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-            long newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-
+            newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
             if (newSize == global_windowSize)
                 newSize--;
-            params.prevRate = 0;
+            prevRate = 0;
             global_windowSize = newSize;
             params.slowdowns = 0;
             params.mdPhases++;
+            cubicIncrease = 1;
         }
     }
 }
+
+void controller_cubicp(controller_params_t &params)
+{
+    static double b = 0.8;
+    static double a = 3 * (1 - b) / (1 + b);
+    static double c = 0.4;
+    static long t_increase = 0;
+    static double w_max = global_numThreads;
+    static long slowStart = 1;
+    static long cubicIncrease = 1;
+    static double prevRate = 0;
+    static double prevPrevRate = 0;
+
+
+    double w_tcp, w_cubic;
+    long newSize = global_windowSize;
+    if (global_windowSize == 1 || params.currentRate >= prevRate)
+    {
+        if (params.phase != 0)
+        {
+            params.avoidedMdPhases ++;
+            params.phase = 0;
+        }
+        params.slowdowns = 0;
+        if (global_windowSize < global_numThreads)
+        {
+            if (slowStart)
+            {
+                newSize = fmin(global_windowSize * 2, global_numThreads);
+            }
+            else if (cubicIncrease)
+            {
+                //printf("Cubic\n");
+                t_increase++;
+                w_tcp = (w_max * b) + (a * t_increase);
+                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+                newSize = (newSize == global_windowSize)||(newSize >= w_max)? global_windowSize + 1: newSize;
+                if (newSize - global_windowSize > 1)
+                {
+                    cubicIncrease = 0;
+                }
+            }
+            else if (!cubicIncrease)
+            {
+                //printf("NonCubic\n");
+                newSize = fmin(global_windowSize + 1, global_numThreads);
+                cubicIncrease = 1;
+            }
+            if (newSize > global_windowSize)
+            {
+                prevPrevRate = prevRate;
+                prevRate = params.currentRate;
+                while (global_windowSize < newSize)
+                {
+                    global_windowSize++;
+                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+                }
+            }
+        }
+    }
+    else
+    {
+        if (params.phase == 0)
+        {
+            global_windowSize -= 1;
+            prevRate = prevPrevRate;
+            params.phase = 1;
+        }
+        else
+        {
+            params.slowdowns++;
+            if (params.slowdowns == params.maxSlowdowns)
+            {
+                slowStart = 0;
+                w_max = global_windowSize;
+                t_increase = 0;
+                w_tcp = (w_max * b) + (a * t_increase);
+                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+                if (newSize == global_windowSize)
+                    newSize--;
+                prevRate = 0;
+                prevPrevRate = 0;
+                global_windowSize = newSize;
+                params.slowdowns = 0;
+                params.phase = 0;
+                params.mdPhases++;
+                cubicIncrease = 1;
+            }
+        }
+    }
+}
+
+void controller_f2c2(controller_params_t &params)
+{
+    static long slowStart = 1;
+    static long incMode = 1;
+    static double prevRate = 0;
+
+    long newSize = global_windowSize;
+
+    if (global_windowSize == 1)
+        incMode = 1;
+
+    if (params.currentRate >= prevRate)
+    {
+        params.slowdowns = 0;
+        if (slowStart)
+        {
+            newSize = fmin(global_windowSize * 2, global_numThreads);
+        }
+        else
+        {
+            newSize = fmax(fmin(global_windowSize + incMode, global_numThreads), 1);
+        }
+        prevRate = params.currentRate;
+    }
+    else
+    {
+        params.slowdowns++;
+        if (params.slowdowns == params.maxSlowdowns)
+        {
+            if (slowStart)
+            {
+                slowStart = 0;
+                newSize = fmin(global_windowSize / 2, global_numThreads);
+                incMode = 1;
+            }
+            else
+            {
+                incMode *= -1;
+                newSize = fmax(fmin(global_windowSize + incMode, global_numThreads), 1);
+            }
+            prevRate = params.currentRate;
+            params.phase = 0;
+            params.slowdowns = 0;
+        }
+    }
+    if (global_windowSize < newSize)
+    {
+        while (global_windowSize < newSize)
+        {
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        global_windowSize = newSize;
+    }
+}
+
 
 /* =============================================================================
  * wait_for_turn
