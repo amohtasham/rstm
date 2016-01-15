@@ -177,6 +177,8 @@ void *controller(void* args)
             policy = aiadpp;
         else if (!strcasecmp(envVar, policies[cubic]))
             policy = cubic;
+        else if (!strcasecmp(envVar, policies[cubicp]))
+            policy = cubicp;
         else if (!strcasecmp(envVar, policies[f2c2]))
             policy = f2c2;
         else
@@ -241,7 +243,7 @@ void *controller(void* args)
             controller_cubic(params);
             break;
         case cubicp:
-            controller_cubic(params);
+            controller_cubicp(params);
             break;
         case f2c2:
             controller_f2c2(params);
@@ -651,7 +653,7 @@ void controller_cubicp(controller_params_t &params)
     }
     else
     {
-        if (params.phase == 0)
+        if (params.phase == 0 && !slowStart)
         {
             global_windowSize -= 1;
             prevRate = prevPrevRate;
