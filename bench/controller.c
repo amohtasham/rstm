@@ -593,9 +593,9 @@ void controller_cubic(controller_params_t &params)
 
 void controller_cubicp(controller_params_t &params)
 {
-    static double b = 0.8;
+    static double b = 0.5;
     static double a = 3 * (1 - b) / (1 + b);
-    static double c = 0.4;
+    static double c = 0.01;
     static long t_increase = 0;
     static double w_max = global_numThreads;
     static long slowStart = 1;
