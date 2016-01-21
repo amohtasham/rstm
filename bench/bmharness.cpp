@@ -31,7 +31,7 @@ using std::cout;
 
 #ifdef DYNAMIC
 #define SEQUENCE_LENGTH 7
-const u_int32_t lookupPercents[3] = {99 , 98, 2};
+const u_int32_t lookupPercents[3] = {100 , 98, 2};
 const u_int32_t lookupSequence[SEQUENCE_LENGTH] = {0, 1, 0, 2, 1, 2, 0};
 volatile u_int32_t lookupSequenceIndex = 0;
 #endif

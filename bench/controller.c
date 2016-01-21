@@ -142,7 +142,7 @@ void *controller(void* args)
     struct timespec rtStart, rtEnd, processStart, processEnd, timer ;
 
     timer.tv_sec = 0;
-    timer.tv_nsec = 100000000; //100 milliseconds
+    timer.tv_nsec = 10000000; //10 milliseconds
     char *envVar = getenv("CONTROLLER_TIMER");
     if (envVar)
         timer.tv_nsec = atol(envVar) * 1000000L; // CONTROLLER_TIMER is in milliseconds
@@ -151,7 +151,7 @@ void *controller(void* args)
     if (envVar)
         params.dConstant = atof(envVar);
 
-    params.maxSlowdowns = 3;
+    params.maxSlowdowns = 1;
     envVar = getenv("MAX_SLOWDOWNS");
     if (envVar)
         params.maxSlowdowns = atoi(envVar);
@@ -161,7 +161,7 @@ void *controller(void* args)
     if (envVar)
         controllerOutput = atoi(envVar);
 
-    policy_t policy = aimdp;
+    policy_t policy = cubicp;
     envVar = getenv("CONTROLLER_POLICY");
     if (envVar)
     {
@@ -606,6 +606,8 @@ void controller_cubicp(controller_params_t &params)
 
     double w_tcp, w_cubic;
     long newSize = global_windowSize;
+
+
     if (global_windowSize == 1 || params.currentRate >= prevRate)
     {
         if (params.phase != 0)
@@ -648,9 +650,17 @@ void controller_cubicp(controller_params_t &params)
                     global_windowSize++;
                     SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
                 }
-            }
+            }            
+        }
+        else if (slowStart == 1)
+        {
+            slowStart = 0;
+            prevRate = params.currentRate;
         }
     }
+
+
+
     else
     {
         if (params.phase == 0 && !slowStart)
