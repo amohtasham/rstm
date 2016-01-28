@@ -29,7 +29,7 @@ typedef enum {
     aiad = 3L,
     aimdpp = 4L,
     aiadpp = 5L,
-    cubic = 6L,
+    cubicc = 6L,
     cubicp = 7L,
     f2c2 = 8L
 } policy_t;
@@ -51,6 +51,12 @@ typedef struct {
 
 } controller_params_t;
 
+typedef enum {
+    linear = 0L,
+    cubic = 1L,
+    exponential = 2L
+
+} change_mode_t;
 
 void controller_aimd(controller_params_t &params);
 void controller_aiad(controller_params_t &params);
@@ -175,8 +181,8 @@ void *controller(void* args)
             policy = aimdpp;
         else if (!strcasecmp(envVar, policies[aiadpp]))
             policy = aiadpp;
-        else if (!strcasecmp(envVar, policies[cubic]))
-            policy = cubic;
+        else if (!strcasecmp(envVar, policies[cubicc]))
+            policy = cubicc;
         else if (!strcasecmp(envVar, policies[cubicp]))
             policy = cubicp;
         else if (!strcasecmp(envVar, policies[f2c2]))
@@ -239,7 +245,7 @@ void *controller(void* args)
         case aimdpp:
             controller_aimdpp(params);
             break;
-        case cubic:
+        case cubicc:
             controller_cubic(params);
             break;
         case cubicp:
@@ -526,7 +532,7 @@ void controller_aiadpp(controller_params_t &params)
 
 void controller_cubic(controller_params_t &params)
 {
-    static double b = 0.5;
+    static double b = 0.8;
     static double a = 3 * (1 - b) / (1 + b);
     static double c = 0.01;
     static long t_increase = 0;
@@ -598,18 +604,142 @@ void controller_cubic(controller_params_t &params)
     }
 }
 
+//void controller_cubicp(controller_params_t &params)
+//{
+//    static double b = 0.7;
+//    static double a = 3 * (1 - b) / (1 + b);
+//    static double c = 1;
+//    static long t_increase = 0;
+//    static double w_max = global_numThreads;
+//    static long slowStart = 1;
+//    static long cubicIncrease = 1;
+//    static double prevRate = 0;
+//    static double prevPrevRate = 0;
+//    static long phase = 0;
+
+
+//    double w_tcp, w_cubic;
+//    long newSize = global_windowSize;
+
+
+//    if (global_windowSize == 1 || params.currentRate >= prevRate)
+//    {
+//        if (phase != 0)
+//        {
+//            params.avoidedMdPhases++;
+//        }
+//        params.slowdowns = 0;
+//        if (global_windowSize < global_numThreads)
+//        {
+//            if (slowStart)
+//            {
+//                newSize = fmin(global_windowSize * 2, global_numThreads);
+//            }
+//            else if (phase > 0)
+//            {
+//                newSize = fmin(global_windowSize + 1, global_numThreads);
+//                prevPrevRate = prevRate;
+//                prevRate = params.currentRate;
+//                cubicIncrease = 0;
+//                phase--;
+//            }
+//            else if (cubicIncrease)
+//            {
+//                //printf("Cubic\n");
+//                t_increase++;
+//                w_tcp = (w_max * b) + (a * t_increase);
+//                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+//                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+//                newSize = (newSize <= global_windowSize)||(newSize >= w_max)? global_windowSize + 1: newSize;
+//                if (newSize - global_windowSize > 1)
+//                {
+//                    cubicIncrease = 0;
+//                }
+//            }
+//            else if (!cubicIncrease)
+//            {
+//                //printf("NonCubic\n");
+//                newSize = fmin(global_windowSize + 1, global_numThreads);
+//                cubicIncrease = 1;
+//            }
+//            if (newSize > global_windowSize)
+//            {
+//                if (newSize - global_windowSize > 1)
+//                    prevPrevRate = 0;
+//                else
+//                    prevPrevRate = prevRate;
+
+//                prevRate = params.currentRate;
+//                while (global_windowSize < newSize)
+//                {
+//                    global_windowSize++;
+//                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+//                }
+//            }
+//        }
+//        else if (slowStart == 1)
+//        {
+//            slowStart = 0;
+//            prevRate = params.currentRate;
+//        }
+//        //prevRate = params.currentRate;
+//    }
+//    else
+//    {
+//        if (phase == 0 && !slowStart)
+//        {
+////            if (prevPrevRate == 0)
+////            {
+////                global_windowSize = fmax(1, global_windowSize - 2);
+////                prevRate = 0;
+////            }
+////            else
+////            {
+////                global_windowSize -= 1;
+////                prevRate = prevPrevRate;
+////            }
+////            cubicIncrease = 0;
+////            phase = 1;
+//            global_windowSize = fmax(1, global_windowSize - 2);
+//            prevRate = 0;
+//            cubicIncrease = 0;
+//            phase = 2;
+//        }
+//        else
+//        {
+//            params.slowdowns++;
+//            if (params.slowdowns == params.maxSlowdowns)
+//            {
+//                slowStart = 0;
+//                w_max = global_windowSize;
+//                t_increase = 0;
+//                w_tcp = (w_max * b) + (a * t_increase);
+//                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
+//                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
+//                if (newSize == global_windowSize)
+//                    newSize--;
+//                prevRate = 0;
+//                prevPrevRate = 0;
+//                global_windowSize = newSize;
+//                params.slowdowns = 0;
+//                phase = 0;
+//                params.mdPhases++;
+//                cubicIncrease = 0;
+//            }
+//        }
+//    }
+//}
+
 void controller_cubicp(controller_params_t &params)
 {
-    static double b = 0.7;
+    static double b = 0.8;
     static double a = 3 * (1 - b) / (1 + b);
-    static double c = 1;
-    static long t_increase = 0;
-    static double w_max = global_numThreads;
-    static long slowStart = 1;
-    static long cubicIncrease = 1;
+    static double c = 0.05;
+    static long streak = 0;
+    static double peak = 1;
+    static change_mode_t growth_mode = cubic;
+    static change_mode_t reduction_mode = linear;
     static double prevRate = 0;
-    static double prevPrevRate = 0;
-    static long phase = 0;
 
 
     double w_tcp, w_cubic;
@@ -618,109 +748,55 @@ void controller_cubicp(controller_params_t &params)
 
     if (global_windowSize == 1 || params.currentRate >= prevRate)
     {
-        if (phase != 0)
-        {
-            params.avoidedMdPhases++;
-        }
         params.slowdowns = 0;
-        if (global_windowSize < global_numThreads)
+        if (growth_mode == exponential)
         {
-            if (slowStart)
-            {
-                newSize = fmin(global_windowSize * 2, global_numThreads);
-            }
-            else if (phase > 0)
-            {
-                newSize = fmin(global_windowSize + 1, global_numThreads);
-                prevPrevRate = prevRate;
-                prevRate = params.currentRate;
-                cubicIncrease = 0;
-                phase--;
-            }
-            else if (cubicIncrease)
-            {
-                //printf("Cubic\n");
-                t_increase++;
-                w_tcp = (w_max * b) + (a * t_increase);
-                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-                newSize = (newSize <= global_windowSize)||(newSize >= w_max)? global_windowSize + 1: newSize;
-                if (newSize - global_windowSize > 1)
-                {
-                    cubicIncrease = 0;
-                }
-            }
-            else if (!cubicIncrease)
-            {
-                //printf("NonCubic\n");
-                newSize = fmin(global_windowSize + 1, global_numThreads);
-                cubicIncrease = 1;
-            }
-            if (newSize > global_windowSize)
-            {
-                if (newSize - global_windowSize > 1)
-                    prevPrevRate = 0;
-                else
-                    prevPrevRate = prevRate;
-
-                prevRate = params.currentRate;
-                while (global_windowSize < newSize)
-                {
-                    global_windowSize++;
-                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
-                }
-            }
+            newSize = fmin(global_windowSize * 2, global_numThreads);
         }
-        else if (slowStart == 1)
+        else if (growth_mode == linear)
         {
-            slowStart = 0;
-            prevRate = params.currentRate;
+            newSize = fmin(global_windowSize + 1, global_numThreads);
+            //if (newSize < peak)
+            if (prevRate != 0)
+                growth_mode = cubic;
         }
-        //prevRate = params.currentRate;
+        else if (growth_mode == cubic)
+        {
+            streak++;
+            w_tcp = (peak * b) + (a * streak);
+            w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
+            newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic), global_windowSize + 1), global_numThreads));
+            growth_mode = linear;
+        }
+        if (prevRate != 0)
+            reduction_mode = linear;
+        prevRate = params.currentRate;
+        while (global_windowSize < newSize)
+        {
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
     }
     else
     {
-        if (phase == 0 && !slowStart)
+        streak = 0;
+        if (reduction_mode == linear)
         {
-//            if (prevPrevRate == 0)
-//            {
-//                global_windowSize = fmax(1, global_windowSize - 2);
-//                prevRate = 0;
-//            }
-//            else
-//            {
-//                global_windowSize -= 1;
-//                prevRate = prevPrevRate;
-//            }
-//            cubicIncrease = 0;
-//            phase = 1;
-            global_windowSize = fmax(1, global_windowSize - 2);
-            prevRate = 0;
-            cubicIncrease = 0;
-            phase = 2;
+            newSize = fmax(1, global_windowSize - 2);
+            reduction_mode = cubic;
         }
         else
         {
-            params.slowdowns++;
-            if (params.slowdowns == params.maxSlowdowns)
-            {
-                slowStart = 0;
-                w_max = global_windowSize;
-                t_increase = 0;
-                w_tcp = (w_max * b) + (a * t_increase);
-                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-                if (newSize == global_windowSize)
-                    newSize--;
-                prevRate = 0;
-                prevPrevRate = 0;
-                global_windowSize = newSize;
-                params.slowdowns = 0;
-                phase = 0;
-                params.mdPhases++;
-                cubicIncrease = 0;
-            }
+            peak = global_windowSize;
+            w_tcp = (peak * b);
+            w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
+            newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic),1), global_windowSize - 1));
+            reduction_mode = linear;
+            params.mdPhases++;
         }
+        global_windowSize = newSize;
+        growth_mode = linear;
+        prevRate = 0;
     }
 }
 
