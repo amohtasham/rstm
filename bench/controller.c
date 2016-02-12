@@ -765,8 +765,9 @@ void controller_cubicp(controller_params_t &params)
             streak++;
             w_tcp = (peak * b) + (a * streak);
             w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
-            newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic), global_windowSize + 1), global_numThreads));
-            growth_mode = linear;
+            newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic), global_windowSize), global_numThreads));
+            if (newSize > global_windowSize + 1)
+                growth_mode = linear;
         }
         if (prevRate != 0)
             reduction_mode = linear;
@@ -779,7 +780,6 @@ void controller_cubicp(controller_params_t &params)
     }
     else
     {
-        streak = 0;
         if (reduction_mode == linear)
         {
             newSize = fmax(1, global_windowSize - 2);
@@ -787,6 +787,7 @@ void controller_cubicp(controller_params_t &params)
         }
         else
         {
+            streak = 0;
             peak = global_windowSize;
             w_tcp = (peak * b);
             w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
