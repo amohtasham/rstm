@@ -5,23 +5,33 @@
  * =============================================================================
  */
 
+#include "controller.h"
+
 #include <assert.h>
 #include <math.h>
 #include <time.h>
-#include "controller.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <float.h>
+
 #include "types.h"
 #include "common/platform.hpp"
 
 #define MALLOC malloc
 #define FREE free
+
 //#define CONTROLLER
 
-const char *policies[9] = {"none","aimdp", "aimd", "aiad", "aimdpp", "aiadpp", "cubic","cubicp","f2c2"};
+const char *policies[10] = {"none","aimdp", "aimd", "aiad", "aimdpp", "aiadpp", "cubic","cubicp","f2c2","central"};
 typedef enum {
     none = 0L,
     aimdp = 1L,
@@ -31,10 +41,16 @@ typedef enum {
     aiadpp = 5L,
     cubicc = 6L,
     cubicp = 7L,
-    f2c2 = 8L
+    f2c2 = 8L,
+    central = 9L
 } policy_t;
 
 typedef struct {
+    struct timespec timer;
+    int controllerOutput;
+    int processOutput;
+    policy_t policy;
+
     unsigned long currentTotalThroughput;
     unsigned long prevTotalThroughput;
     int phase;
@@ -51,12 +67,48 @@ typedef struct {
 
 } controller_params_t;
 
+
 typedef enum {
     linear = 0L,
     cubic = 1L,
     exponential = 2L
 
 } change_mode_t;
+
+/* =============================================================================
+ * data structures and declarations for coordination with a cental daemon
+ * =============================================================================
+ */
+#define MAX_PROCESSES 64
+#define SHARED_REGION_FILENAME "/myregion"
+
+typedef struct {
+    pid_t pid;
+    double prevRate;
+    double currentRate;
+    long currentWindowSize;
+    long prevWindowSize;
+    long windowStart;
+    long pendingUpdates;
+} process_t;
+
+typedef struct {
+    process_t processes[MAX_PROCESSES];
+    long initialized;
+    long len;
+    long lock;
+} shared_region_t;
+
+
+int shared_region_fd;
+shared_region_t *shared_region;
+int shared_region_index;
+
+void central_client_init();
+void central_client_free();
+
+/* ============================================================================= */
+
 
 void controller_aimd(controller_params_t &params);
 void controller_aiad(controller_params_t &params);
@@ -66,6 +118,7 @@ void controller_aiadpp(controller_params_t &params);
 void controller_cubic(controller_params_t &params);
 void controller_cubicp(controller_params_t &params);
 void controller_f2c2(controller_params_t &params);
+void controller_central(controller_params_t &params);
 
 extern volatile bool_t   global_isTerminated;
 extern volatile bool_t   global_timedExecution;
@@ -77,8 +130,23 @@ long global_activeThreads;
 
 metadata_t* global_metadata;
 pthread_t controllerThread;
+controller_params_t params;
 
 
+void lock(long *l)
+{
+    while (1)
+    {
+        while (*l != 0) {};
+        if (__sync_bool_compare_and_swap(l, 0, 1))
+            break;
+    }
+}
+
+void unlock(long *l)
+{
+    l = 0;
+}
 
 /* =============================================================================
  * controller_alloc
@@ -101,16 +169,75 @@ void controller_alloc(long numThreads)
     global_numThreads = numThreads;
     global_activeThreads = numThreads;
 
+
+    params.timer.tv_sec = 0;
+    params.timer.tv_nsec = 10000000; //10 milliseconds
+    char *envVar = getenv("CONTROLLER_TIMER");
+    if (envVar)
+        params.timer.tv_nsec = atol(envVar) * 1000000L; // CONTROLLER_TIMER is in milliseconds
+    params.dConstant = 2;
+    envVar = getenv("MD_CONSTANT");
+    if (envVar)
+        params.dConstant = atof(envVar);
+
+    params.maxSlowdowns = 1;
+    envVar = getenv("MAX_SLOWDOWNS");
+    if (envVar)
+        params.maxSlowdowns = atoi(envVar);
+
+    params.controllerOutput = 1;
+    envVar = getenv("CONTROLLER_OUTPUT");
+    if (envVar)
+        params.controllerOutput = atoi(envVar);
+
+    params.processOutput = 1;
+    envVar = getenv("PROCESS_OUTPUT");
+    if (envVar)
+        params.processOutput = atoi(envVar);
+
+    params.policy = central;
+    envVar = getenv("CONTROLLER_POLICY");
+    if (envVar)
+    {
+        if (!strcasecmp(envVar, policies[aimd]))
+            params.policy = aimd;
+        else if (!strcasecmp(envVar, policies[aiad]))
+            params.policy = aiad;
+        else if (!strcasecmp(envVar, policies[aimdp]))
+            params.policy = aimdp;
+        else if (!strcasecmp(envVar, policies[aimdpp]))
+            params.policy = aimdpp;
+        else if (!strcasecmp(envVar, policies[aiadpp]))
+            params.policy = aiadpp;
+        else if (!strcasecmp(envVar, policies[cubicc]))
+            params.policy = cubicc;
+        else if (!strcasecmp(envVar, policies[cubicp]))
+            params.policy = cubicp;
+        else if (!strcasecmp(envVar, policies[f2c2]))
+            params.policy = f2c2;
+        else if (!strcasecmp(envVar, policies[central]))
+            params.policy = central;
+        else
+            params.policy = none;
+    }
+    printf("\nPolicy: %s\n", policies[params.policy]);
+
+    params.currentTotalThroughput = 0;
+    params.prevTotalThroughput = 0;
+    params.currentRate = 0;
+    params.mdPhases = 0;
+    params.avoidedMdPhases = 0;
+    params.fairnessPhases = 0;
+    params.slowdowns = 0;
+
+
     pthread_attr_t controller_attr;
     struct sched_param param;
     param.__sched_priority = 99;
     pthread_attr_init(&controller_attr);
     pthread_attr_setschedpolicy(&controller_attr, SCHED_RR);
-    pthread_attr_setschedparam(&controller_attr,&param);
+    pthread_attr_setschedparam(&controller_attr,&param);       
 
-    /* Initialize mutex and condition variable objects */
-    //pthread_mutex_init(&count_mutex, NULL);
-    //pthread_cond_init(&count_threshold_cv, NULL);
     pthread_create(&controllerThread, &controller_attr, &controller, NULL);
 #endif
 }
@@ -143,74 +270,24 @@ void *controller(void* args)
     unsigned long  iterations = 0;
 
     int max = 0;
-    controller_params_t params;
 
-    struct timespec rtStart, rtEnd, processStart, processEnd, timer ;
+    struct timespec rtStart, rtEnd ;
 
-    timer.tv_sec = 0;
-    timer.tv_nsec = 10000000; //10 milliseconds
-    char *envVar = getenv("CONTROLLER_TIMER");
-    if (envVar)
-        timer.tv_nsec = atol(envVar) * 1000000L; // CONTROLLER_TIMER is in milliseconds
-    params.dConstant = 2;
-    envVar = getenv("MD_CONSTANT");
-    if (envVar)
-        params.dConstant = atof(envVar);
-
-    params.maxSlowdowns = 1;
-    envVar = getenv("MAX_SLOWDOWNS");
-    if (envVar)
-        params.maxSlowdowns = atoi(envVar);
-
-    int controllerOutput = 1;
-    envVar = getenv("CONTROLLER_OUTPUT");
-    if (envVar)
-        controllerOutput = atoi(envVar);
-
-    policy_t policy = cubicp;
-    envVar = getenv("CONTROLLER_POLICY");
-    if (envVar)
+    global_windowSize = (params.policy == none)? global_numThreads: 1;
+    if (params.policy == none)
+        global_windowSize = global_numThreads;
+    else if (params.policy == central)
     {
-        if (!strcasecmp(envVar, policies[aimd]))
-            policy = aimd;
-        else if (!strcasecmp(envVar, policies[aiad]))
-            policy = aiad;
-        else if (!strcasecmp(envVar, policies[aimdp]))
-            policy = aimdp;
-        else if (!strcasecmp(envVar, policies[aimdpp]))
-            policy = aimdpp;
-        else if (!strcasecmp(envVar, policies[aiadpp]))
-            policy = aiadpp;
-        else if (!strcasecmp(envVar, policies[cubicc]))
-            policy = cubicc;
-        else if (!strcasecmp(envVar, policies[cubicp]))
-            policy = cubicp;
-        else if (!strcasecmp(envVar, policies[f2c2]))
-            policy = f2c2;
-        else
-            policy = none;
+        global_windowSize = 0;
+        central_client_init();
     }
-    printf("\nPolicy: %s\n", policies[policy]);
+    else
+        global_windowSize = 1;
 
-    global_windowSize = (policy == none)? global_numThreads: 1;
 
-
-    params.currentTotalThroughput = 0;
-    params.prevTotalThroughput = 0;
-    params.currentRate = 0;
-    params.mdPhases = 0;
-    params.avoidedMdPhases = 0;
-    params.fairnessPhases = 0;
-    params.slowdowns = 0;
     while (global_windowSize != global_activeThreads && !global_isTerminated)
     {
-        //if (controllerOutput)
-        //printf("wnd = %ld   #threads = %ld\r\n",global_windowSize,global_activeThreads);
         usleep(1);
-    }
-    while (!global_isTerminated && params.prevTotalThroughput == 0)
-    {
-        params.prevTotalThroughput = get_total_throughput();
     }
 
     //clock_gettime(CLOCK_REALTIME, &rtStart);
@@ -219,7 +296,7 @@ void *controller(void* args)
     {
         params.prevTotalThroughput = get_total_throughput();
         clock_gettime(CLOCK_REALTIME, &rtStart);
-        nanosleep(&timer, NULL);
+        nanosleep(&params.timer, NULL);
         clock_gettime(CLOCK_REALTIME, &rtEnd);
         //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processEnd);
         params.currentTotalThroughput = get_total_throughput();
@@ -229,10 +306,10 @@ void *controller(void* args)
         //rtStart = rtEnd;
         //processStart = processEnd;
         //params.prevTotalThroughput = params.currentTotalThroughput;
-        if (controllerOutput)
+        if (params.controllerOutput)
             printf("%lu;%ld;%ld;%.2f \r\n", rtEnd.tv_sec * 1000000000L + rtEnd.tv_nsec, global_windowStart, global_windowSize, params.currentRate);
 
-        switch (policy) {
+        switch (params.policy) {
         case aimd:
             controller_aimd(params);
             break;
@@ -254,6 +331,9 @@ void *controller(void* args)
         case f2c2:
             controller_f2c2(params);
             break;
+        case central:
+            controller_central(params);
+            break;
         default:
             break;
         }
@@ -263,7 +343,7 @@ void *controller(void* args)
         max = max >= global_windowSize? max : global_windowSize;
         while (global_windowSize != global_activeThreads && !global_isTerminated)
         {
-            //if (controllerOutput)
+            //if (params.controllerOutput)
             //printf("wnd = %ld   #threads = %ld\r\n",global_windowSize,global_activeThreads);
             usleep(1);
         };
@@ -273,21 +353,83 @@ void *controller(void* args)
     for (tid = 0 ; tid < global_numThreads ; tid++)
         SEM_POST(global_metadata[tid].semaphore);
 
-    int process_output = 1;
-    envVar = getenv("PROCESS_OUTPUT");
-    if (envVar)
-        process_output = atoi(envVar);
-    if (process_output)
+
+    if (params.processOutput)
     {
         printf("\r\nThread-count = %.2f\r\n", threadAvg);
         printf("Fairness Phases = %d\r\n", params.fairnessPhases);
         printf("MD-Phases = %d\r\n", params.mdPhases);
         printf("Avoided MD-Phases = %d\r\n", params.avoidedMdPhases);
     }
+
+    if (params.policy == central)
+        central_client_free();
+
     pthread_exit(NULL);
 }
 
+/* =============================================================================
+ * central_client_init
+ * -- Initilizes this client to coordinate with a central daemon
+ * =============================================================================
+ */
+void central_client_init()
+{
+    printf("\nWaiting for the shared region...");
+    fflush(stdout);
+    //while (access(SHARED_REGION_FILENAME, F_OK) == -1) {/*wait for the coordinator*/};
+    do
+        shared_region_fd = shm_open(SHARED_REGION_FILENAME, O_RDWR, S_IRUSR | S_IWUSR);
+    while (shared_region_fd == -1);
+    printf("\nShared region found!");
+    fflush(stdout);
+    /* Create shared memory object and set its size */
+    //shared_region_fd = shm_open(SHARED_REGION_FILENAME, O_RDWR, S_IRUSR | S_IWUSR);
+    //assert(shared_region_fd != -1);
 
+    /* Map shared memory object */
+    shared_region = (shared_region_t *)mmap(NULL, sizeof(shared_region_t), PROT_READ | PROT_WRITE, MAP_SHARED, shared_region_fd, 0);
+    assert(shared_region != MAP_FAILED);
+    printf("\nShared region mapped.");
+    fflush(stdout);
+
+    lock(&shared_region->lock);
+    printf("\nLock acquired.");
+    fflush(stdout);
+    for (int i = 0 ; i < shared_region->len ; i++)
+    {
+        if (shared_region->processes[i].pid == 0 && shared_region->processes[i].currentWindowSize == 0)
+        {
+            shared_region->processes[i].currentWindowSize = global_windowSize;
+            shared_region->processes[i].prevWindowSize = 0;
+            shared_region->processes[i].currentRate = 0;
+            shared_region->processes[i].prevRate = 0;
+            shared_region_index = i;
+            CFENCE;
+            shared_region->processes[i].pid = getpid();
+            break;
+        }
+    }
+    unlock(&shared_region->lock);
+}
+
+/* =============================================================================
+ * central_client_free
+ * -- frees the shared resources
+ * =============================================================================
+ */
+void central_client_free()
+{
+    shared_region->processes[shared_region_index].pid = 0;
+    shared_region->processes[shared_region_index].pendingUpdates = 0;
+    munmap(shared_region, sizeof(shared_region_t));
+    shm_unlink(SHARED_REGION_FILENAME);
+}
+
+/* =============================================================================
+ * Allocator policies
+ * =============================================================================
+ */
 void controller_aimd(controller_params_t &params)
 {
     static long slowStart = 1;
@@ -459,7 +601,6 @@ void controller_aimdpp(controller_params_t &params)
 void controller_aiad(controller_params_t &params)
 {
     static double prevRate = 0;
-    static long phase = 0;
 
     if (global_windowSize == 1 || params.currentRate > prevRate)
     {
@@ -481,7 +622,6 @@ void controller_aiad(controller_params_t &params)
             newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
             prevRate = 0;
             global_windowSize = newMax;
-            phase = 0;
             params.slowdowns = 0;
         }
     }
@@ -490,18 +630,13 @@ void controller_aiad(controller_params_t &params)
 void controller_aiadpp(controller_params_t &params)
 {
     static double prevRate = 0;
-    static double prevPrevRate = 0;
-    static long phase = 0;
 
 
     if ((global_windowSize > 1) && (params.actualDelay * (global_windowSize - 1) > params.processTime))
     {
         //the system is oversubscribed
         global_windowSize = (long)floor((double)params.processTime / (double)params.actualDelay);
-        phase = 0;
         prevRate = 0;
-        prevPrevRate = 0;
-        phase = 0;
         params.slowdowns = 0;
     }
     else if (global_windowSize == 1 || params.currentRate > prevRate)
@@ -524,7 +659,6 @@ void controller_aiadpp(controller_params_t &params)
             newMax = global_windowSize - 2 > 0 ? global_windowSize - 2 : 1;
             prevRate = 0;
             global_windowSize = newMax;
-            phase = 0;
             params.slowdowns = 0;
         }
     }
@@ -604,132 +738,6 @@ void controller_cubic(controller_params_t &params)
     }
 }
 
-//void controller_cubicp(controller_params_t &params)
-//{
-//    static double b = 0.7;
-//    static double a = 3 * (1 - b) / (1 + b);
-//    static double c = 1;
-//    static long t_increase = 0;
-//    static double w_max = global_numThreads;
-//    static long slowStart = 1;
-//    static long cubicIncrease = 1;
-//    static double prevRate = 0;
-//    static double prevPrevRate = 0;
-//    static long phase = 0;
-
-
-//    double w_tcp, w_cubic;
-//    long newSize = global_windowSize;
-
-
-//    if (global_windowSize == 1 || params.currentRate >= prevRate)
-//    {
-//        if (phase != 0)
-//        {
-//            params.avoidedMdPhases++;
-//        }
-//        params.slowdowns = 0;
-//        if (global_windowSize < global_numThreads)
-//        {
-//            if (slowStart)
-//            {
-//                newSize = fmin(global_windowSize * 2, global_numThreads);
-//            }
-//            else if (phase > 0)
-//            {
-//                newSize = fmin(global_windowSize + 1, global_numThreads);
-//                prevPrevRate = prevRate;
-//                prevRate = params.currentRate;
-//                cubicIncrease = 0;
-//                phase--;
-//            }
-//            else if (cubicIncrease)
-//            {
-//                //printf("Cubic\n");
-//                t_increase++;
-//                w_tcp = (w_max * b) + (a * t_increase);
-//                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-//                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-//                newSize = (newSize <= global_windowSize)||(newSize >= w_max)? global_windowSize + 1: newSize;
-//                if (newSize - global_windowSize > 1)
-//                {
-//                    cubicIncrease = 0;
-//                }
-//            }
-//            else if (!cubicIncrease)
-//            {
-//                //printf("NonCubic\n");
-//                newSize = fmin(global_windowSize + 1, global_numThreads);
-//                cubicIncrease = 1;
-//            }
-//            if (newSize > global_windowSize)
-//            {
-//                if (newSize - global_windowSize > 1)
-//                    prevPrevRate = 0;
-//                else
-//                    prevPrevRate = prevRate;
-
-//                prevRate = params.currentRate;
-//                while (global_windowSize < newSize)
-//                {
-//                    global_windowSize++;
-//                    SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
-//                }
-//            }
-//        }
-//        else if (slowStart == 1)
-//        {
-//            slowStart = 0;
-//            prevRate = params.currentRate;
-//        }
-//        //prevRate = params.currentRate;
-//    }
-//    else
-//    {
-//        if (phase == 0 && !slowStart)
-//        {
-////            if (prevPrevRate == 0)
-////            {
-////                global_windowSize = fmax(1, global_windowSize - 2);
-////                prevRate = 0;
-////            }
-////            else
-////            {
-////                global_windowSize -= 1;
-////                prevRate = prevPrevRate;
-////            }
-////            cubicIncrease = 0;
-////            phase = 1;
-//            global_windowSize = fmax(1, global_windowSize - 2);
-//            prevRate = 0;
-//            cubicIncrease = 0;
-//            phase = 2;
-//        }
-//        else
-//        {
-//            params.slowdowns++;
-//            if (params.slowdowns == params.maxSlowdowns)
-//            {
-//                slowStart = 0;
-//                w_max = global_windowSize;
-//                t_increase = 0;
-//                w_tcp = (w_max * b) + (a * t_increase);
-//                w_cubic = c * pow(t_increase - pow(w_max * b / c, 1.0 / 3.0), 3) + w_max;
-//                newSize = (long)round(fmin(fmax(w_tcp, w_cubic), global_numThreads));
-//                if (newSize == global_windowSize)
-//                    newSize--;
-//                prevRate = 0;
-//                prevPrevRate = 0;
-//                global_windowSize = newSize;
-//                params.slowdowns = 0;
-//                phase = 0;
-//                params.mdPhases++;
-//                cubicIncrease = 0;
-//            }
-//        }
-//    }
-//}
-
 void controller_cubicp(controller_params_t &params)
 {
     static double b = 0.8;
@@ -806,7 +814,6 @@ void controller_f2c2(controller_params_t &params)
     static long slowStart = 1;
     static long incMode = 1;
     static double prevRate = 0;
-    static long phase = 0;
 
 
     long newSize = global_windowSize;
@@ -844,7 +851,6 @@ void controller_f2c2(controller_params_t &params)
                 newSize = fmax(fmin(global_windowSize + incMode, global_numThreads), 1);
             }
             prevRate = params.currentRate;
-            phase = 0;
             params.slowdowns = 0;
         }
     }
@@ -859,6 +865,38 @@ void controller_f2c2(controller_params_t &params)
     else
     {
         global_windowSize = newSize;
+    }
+}
+
+void controller_central(controller_params_t &params)
+{
+    static process_t *process = &shared_region->processes[shared_region_index];
+    static double currentRateEMA;//EMA: Exponentional Moving Average
+    double emaFactor = 0.5;
+    if (currentRateEMA == 0)
+        currentRateEMA = params.currentRate;
+    else
+        currentRateEMA = currentRateEMA * (1 - emaFactor) + params.currentRate * emaFactor;
+    if (process->pendingUpdates)
+    {
+        process->prevRate = currentRateEMA;
+        process->prevWindowSize = global_windowSize;
+        currentRateEMA = 0;
+        process->currentRate = 0;
+        long newSize = process->currentWindowSize;
+        CFENCE;
+        process->pendingUpdates = 0;
+        if (global_windowSize < newSize)
+        {
+            while (global_windowSize < newSize)
+            {
+                global_windowSize++;
+                SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+            }
+        }
+        else
+            global_windowSize = newSize;
+
     }
 }
 
@@ -929,7 +967,7 @@ ulong_t get_total_throughput()
 ulong_t get_thread_time()
 {
     //return tick();
-#if CONTROLLER
+#ifdef CONTROLLER
     struct timespec timeSpec;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &timeSpec);
     return (timeSpec.tv_sec * 1000000L) + (timeSpec.tv_nsec / 1000L);
@@ -939,7 +977,6 @@ ulong_t get_thread_time()
     return (timeSpec.tv_sec * 1000000L) + (timeSpec.tv_nsec / 1000L);
 #endif
 }
-
 
 /* =============================================================================
  *
