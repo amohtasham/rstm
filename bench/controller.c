@@ -76,11 +76,11 @@ typedef enum {
 } change_mode_t;
 
 /* =============================================================================
- * data structures and declarations for coordination with a cental daemon
+ * data structures and declarations for coordination with a central daemon
  * =============================================================================
  */
 #define MAX_PROCESSES 64
-#define SHARED_REGION_FILENAME "/myregion"
+#define SHARED_REGION_FILENAME "myregion"
 
 typedef struct {
     pid_t pid;
@@ -96,7 +96,7 @@ typedef struct {
     process_t processes[MAX_PROCESSES];
     long initialized;
     long len;
-    long lock;
+    volatile long lock;
 } shared_region_t;
 
 
@@ -133,7 +133,8 @@ pthread_t controllerThread;
 controller_params_t params;
 
 
-void lock(long *l)
+void lock(volatile long *l)
+
 {
     while (1)
     {
@@ -143,9 +144,9 @@ void lock(long *l)
     }
 }
 
-void unlock(long *l)
+void unlock(volatile long *l)
 {
-    l = 0;
+    *l = 0;
 }
 
 /* =============================================================================
@@ -236,7 +237,7 @@ void controller_alloc(long numThreads)
     param.__sched_priority = 99;
     pthread_attr_init(&controller_attr);
     pthread_attr_setschedpolicy(&controller_attr, SCHED_RR);
-    pthread_attr_setschedparam(&controller_attr,&param);       
+    pthread_attr_setschedparam(&controller_attr,&param);
 
     pthread_create(&controllerThread, &controller_attr, &controller, NULL);
 #endif
@@ -283,7 +284,6 @@ void *controller(void* args)
     }
     else
         global_windowSize = 1;
-
 
     while (global_windowSize != global_activeThreads && !global_isTerminated)
     {
@@ -393,24 +393,31 @@ void central_client_init()
     printf("\nShared region mapped.");
     fflush(stdout);
 
+    printf("\nAcquiring the lock ...", shared_region->lock);
+    fflush(stdout);
     lock(&shared_region->lock);
     printf("\nLock acquired.");
     fflush(stdout);
     for (int i = 0 ; i < shared_region->len ; i++)
     {
-        if (shared_region->processes[i].pid == 0 && shared_region->processes[i].currentWindowSize == 0)
+//        if (shared_region->processes[i].pid == 0 && shared_region->processes[i].currentWindowSize == 0)
+        if (shared_region->processes[i].pid == 0)
         {
             shared_region->processes[i].currentWindowSize = global_windowSize;
             shared_region->processes[i].prevWindowSize = 0;
             shared_region->processes[i].currentRate = 0;
             shared_region->processes[i].prevRate = 0;
+            shared_region->processes[i].pendingUpdates = 0;
             shared_region_index = i;
             CFENCE;
             shared_region->processes[i].pid = getpid();
+            printf("\nClient registration done at slot %d.", shared_region_index);
             break;
         }
     }
     unlock(&shared_region->lock);
+    printf("\nLock released.");
+    fflush(stdout);
 }
 
 /* =============================================================================
@@ -423,7 +430,7 @@ void central_client_free()
     shared_region->processes[shared_region_index].pid = 0;
     shared_region->processes[shared_region_index].pendingUpdates = 0;
     munmap(shared_region, sizeof(shared_region_t));
-    shm_unlink(SHARED_REGION_FILENAME);
+    //shm_unlink(SHARED_REGION_FILENAME);
 }
 
 /* =============================================================================
@@ -898,6 +905,8 @@ void controller_central(controller_params_t &params)
             global_windowSize = newSize;
 
     }
+    else
+        process->currentRate = currentRateEMA;
 }
 
 
@@ -913,7 +922,8 @@ void wait_for_turn(long threadId)
     long windowSize = global_windowSize;
     long windowEnd = (windowStart + windowSize - 1) % global_numThreads;
     if ((windowEnd >= windowStart && (threadId < windowStart || threadId > windowEnd)) ||
-            (windowEnd < windowStart && threadId < windowStart && threadId > windowEnd))
+            (windowEnd < windowStart && threadId < windowStart && threadId > windowEnd) ||
+            windowSize == 0)
     {
         __sync_fetch_and_sub(&global_activeThreads, 1);
         SEM_WAIT(global_metadata[threadId].semaphore);
