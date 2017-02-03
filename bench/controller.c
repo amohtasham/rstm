@@ -72,7 +72,6 @@ typedef enum {
     linear = 0L,
     cubic = 1L,
     exponential = 2L
-
 } change_mode_t;
 
 /* =============================================================================
@@ -123,10 +122,11 @@ void controller_central(controller_params_t &params);
 extern volatile bool_t   global_isTerminated;
 extern volatile bool_t   global_timedExecution;
 
-long global_windowStart;
-long global_windowSize;
-long global_numThreads;
-long global_activeThreads;
+volatile long global_windowStart;
+volatile long global_windowSize;
+volatile long global_numThreads;
+volatile long global_activeThreads;
+volatile bool_t global_controller_initialized = false;
 
 metadata_t* global_metadata;
 pthread_t controllerThread;
@@ -274,7 +274,6 @@ void *controller(void* args)
 
     struct timespec rtStart, rtEnd ;
 
-    global_windowSize = (params.policy == none)? global_numThreads: 1;
     if (params.policy == none)
         global_windowSize = global_numThreads;
     else if (params.policy == central)
@@ -285,10 +284,20 @@ void *controller(void* args)
     else
         global_windowSize = 1;
 
-    while (global_windowSize != global_activeThreads && !global_isTerminated)
+    // From this point on, the controller and the worker threads are synchronized
+    // and the workers must wait for their turn
+    global_controller_initialized = true;
+
+    while (global_windowSize < global_activeThreads && !global_isTerminated)
     {
         usleep(1);
     }
+
+//    if (!global_isTerminated)
+//    {
+//        printf("\r\nEntering the controller loop ... \r\n");
+//    }
+
 
     //clock_gettime(CLOCK_REALTIME, &rtStart);
     //clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &processStart);
@@ -357,6 +366,7 @@ void *controller(void* args)
     if (params.processOutput)
     {
         printf("\r\nThread-count = %.2f\r\n", threadAvg);
+        printf("Iterations = %lu\r\n", iterations);
         printf("Fairness Phases = %d\r\n", params.fairnessPhases);
         printf("MD-Phases = %d\r\n", params.mdPhases);
         printf("Avoided MD-Phases = %d\r\n", params.avoidedMdPhases);
@@ -481,6 +491,7 @@ void controller_aimd(controller_params_t &params)
     }
 }
 
+/*
 void controller_aimdp(controller_params_t &params)
 {
     static long slowStart = 1;
@@ -542,6 +553,49 @@ void controller_aimdp(controller_params_t &params)
             }
         }
 
+    }
+}
+*/
+void controller_aimdp(controller_params_t &params)
+{
+    static double b = 0.8;//Multiplicative factor
+    static change_mode_t reduction_mode = linear;
+    static double prevRate = 0;
+
+
+    double w_tcp;
+    long newSize = global_windowSize;
+
+
+    if (global_windowSize == 1 || params.currentRate >= prevRate)
+    {
+        params.slowdowns = 0;
+        newSize = fmin(global_windowSize + 1, global_numThreads);
+        if (prevRate != 0)
+            reduction_mode = linear;
+        prevRate = params.currentRate;
+        while (global_windowSize < newSize)
+        {
+            global_windowSize++;
+            SEM_POST(global_metadata[((global_windowStart + global_windowSize - 1) % global_numThreads)].semaphore);
+        }
+    }
+    else
+    {
+        if (reduction_mode == linear)
+        {
+            newSize = fmax(1, global_windowSize - 2);
+            reduction_mode = exponential;
+        }
+        else
+        {
+            w_tcp = (global_windowSize * b);
+            newSize = (long)round(fmin(fmax(w_tcp,1), global_windowSize - 1));
+            reduction_mode = linear;
+            params.mdPhases++;
+        }
+        global_windowSize = newSize;
+        prevRate = 0;
     }
 }
 
@@ -747,9 +801,9 @@ void controller_cubic(controller_params_t &params)
 
 void controller_cubicp(controller_params_t &params)
 {
-    static double b = 0.8;
+    static double b = 0.8;//alpha in RUBIC
     static double a = 3 * (1 - b) / (1 + b);
-    static double c = 0.05;
+    static double c = 0.05;//Beta in RUBIC
     static long streak = 0;
     static double peak = 1;
     static change_mode_t growth_mode = cubic;
@@ -918,6 +972,8 @@ void controller_central(controller_params_t &params)
 void wait_for_turn(long threadId)
 {
 #ifdef CONTROLLER
+    if (!global_controller_initialized)
+        return;
     long windowStart = global_windowStart;
     long windowSize = global_windowSize;
     long windowEnd = (windowStart + windowSize - 1) % global_numThreads;
