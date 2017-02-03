@@ -245,6 +245,9 @@ NOINLINE
 void*
 run_wrapper(void* i)
 {
+    while (!global_startExecution) {
+        usleep(10);
+    };
     run((uintptr_t)i);
     TM_THREAD_SHUTDOWN();
     return NULL;
@@ -262,6 +265,24 @@ int main(int argc, char** argv) {
     TM_THREAD_INIT();
     bench_init();
 
+    int coordinatorPID = 0;
+    char *envVar = getenv("COORDINATOR_PID");
+    if (envVar)
+        coordinatorPID = atoi(envVar);
+    int synchronizedExecution = 0;
+    envVar = getenv("SYNCHRONIZED_EXECUTION");
+    if (envVar)
+        synchronizedExecution = atoi(envVar);
+
+    if (synchronizedExecution && coordinatorPID)
+    {
+        printf("Synchronized execution is enabled.\n");
+        global_startExecution = FALSE;
+        signal(SIGUSR1, signal_handler);
+    }
+    else
+        global_startExecution = TRUE;
+
     void* args[256];
     pthread_t tid[256];
 
@@ -276,19 +297,8 @@ int main(int argc, char** argv) {
     for (uint32_t j = 1; j < CFG.threads; j++)
         pthread_create(&tid[j], &attr, &run_wrapper, args[j]);
 
-    int coordinatorPID = 0;
-    char *envVar = getenv("COORDINATOR_PID");
-    if (envVar)
-        coordinatorPID = atoi(envVar);
-    int synchronizedExecution = 0;
-    envVar = getenv("SYNCHRONIZED_EXECUTION");
-    if (envVar)
-        synchronizedExecution = atoi(envVar);
     if (synchronizedExecution && coordinatorPID)
     {
-        printf("Synchronized execution is enabled.\n");
-        global_startExecution = FALSE;
-        signal(SIGUSR1, signal_handler);
         printf("I'm ready. Sending SIGUSR1 to the co-ordinator...\n");
         kill(coordinatorPID, SIGUSR1);//Letting the co-ordinator know that the process is ready for executing the workload
         printf("Waiting for the acknowledgement...\n");
