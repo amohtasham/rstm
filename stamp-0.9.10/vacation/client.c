@@ -178,7 +178,7 @@ client_run (void* argPtr)
     long* ops    = (long*)P_MALLOC(numQueryPerTransaction * sizeof(long));
     long* prices = (long*)P_MALLOC(numQueryPerTransaction * sizeof(long));
 
-    ulong_t beginTime;
+    //ulong_t beginTime;
     long i = 0;
     while ((i < numOperation && !global_timedExecution) || (!global_isTerminated && global_timedExecution)) {
         wait_for_turn(myId);
@@ -206,7 +206,7 @@ client_run (void* argPtr)
                 //        transaction, so that it is reset on abort?
                 bool_t isFound = FALSE;
                 TM_BEGIN();
-                beginTime = get_thread_time_micro();
+                //beginTime = get_thread_time();
                 for (n = 0; n < numQuery; n++) {
                     long t = types[n];
                     long id = ids[n];
@@ -252,21 +252,20 @@ client_run (void* argPtr)
                                          customerId, maxIds[RESERVATION_ROOM]);
                 }
                 TM_END();
-                add_throughput(myId, get_thread_time_micro() - beginTime);
-
+                //add_throughput(myId, get_thread_time() - beginTime);
                 break;
             }
 
             case ACTION_DELETE_CUSTOMER: {
                 long customerId = random_generate(randomPtr) % queryRange + 1;
                 TM_BEGIN();
-                beginTime = get_thread_time_micro();
+                //beginTime = get_thread_time();
                 long bill = MANAGER_QUERY_CUSTOMER_BILL(managerPtr, customerId);
                 if (bill >= 0) {
                     MANAGER_DELETE_CUSTOMER(managerPtr, customerId);
                 }
                 TM_END();
-                add_throughput(myId, get_thread_time_micro() - beginTime);
+                //add_throughput(myId, get_thread_time() - beginTime);
                 break;
             }
 
@@ -282,7 +281,7 @@ client_run (void* argPtr)
                     }
                 }
                 TM_BEGIN();
-                beginTime = get_thread_time_micro();
+                //beginTime = get_thread_time();
                 for (n = 0; n < numUpdate; n++) {
                     long t = types[n];
                     long id = ids[n];
@@ -319,7 +318,7 @@ client_run (void* argPtr)
                     }
                 }
                 TM_END();
-                add_throughput(myId, get_thread_time_micro() - beginTime);
+                //add_throughput(myId, get_thread_time() - beginTime);
                 break;
             }
 
@@ -327,7 +326,7 @@ client_run (void* argPtr)
                 assert(0);
 
         } /* switch (action) */
-        //add_throughput(myId, 1);
+        add_throughput(myId, 1);
 
     } /* for i */
 
