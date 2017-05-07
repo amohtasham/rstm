@@ -61,6 +61,8 @@ typedef struct {
     int fairnessPhases;
     int slowdowns;
     float dConstant;
+    float rubicAlpha;
+    float rubicBeta;
     int maxSlowdowns;
     unsigned long actualDelay;
     unsigned long processTime;
@@ -180,6 +182,16 @@ void controller_alloc(long numThreads)
     envVar = getenv("MD_CONSTANT");
     if (envVar)
         params.dConstant = atof(envVar);
+
+    params.rubicAlpha= 0.8;
+    envVar = getenv("RUBIC_ALPHA");
+    if (envVar)
+        params.rubicAlpha = atof(envVar);
+
+    params.rubicBeta= 0.05;
+    envVar = getenv("RUBIC_BETA");
+    if (envVar)
+        params.rubicBeta = atof(envVar);
 
     params.maxSlowdowns = 1;
     envVar = getenv("MAX_SLOWDOWNS");
@@ -801,9 +813,12 @@ void controller_cubic(controller_params_t &params)
 
 void controller_cubicp(controller_params_t &params)
 {
-    static double b = 0.8;//alpha in RUBIC
-    static double a = 3 * (1 - b) / (1 + b);
-    static double c = 0.05;//Beta in RUBIC
+//    static double b = 0.8;//alpha in RUBIC
+//    static double a = 3 * (1 - b) / (1 + b);
+//    static double c = 0.05;//Beta in RUBIC
+    const static double alpha = params.rubicAlpha;
+    const static double a = 3 * (1 - alpha) / (1 + alpha);
+    const static double beta = params.rubicBeta;
     static long streak = 0;
     static double peak = 1;
     static change_mode_t growth_mode = cubic;
@@ -832,8 +847,8 @@ void controller_cubicp(controller_params_t &params)
         else if (growth_mode == cubic)
         {
             streak++;
-            w_tcp = (peak * b) + (a * streak);
-            w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
+            w_tcp = (peak * alpha) + (a * streak);
+            w_cubic = beta * pow(streak - pow(peak * alpha / beta, 1.0 / 3.0), 3) + peak;
             newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic), global_windowSize), global_numThreads));
             if (newSize > global_windowSize + 1)
                 growth_mode = linear;
@@ -858,8 +873,8 @@ void controller_cubicp(controller_params_t &params)
         {
             streak = 0;
             peak = global_windowSize;
-            w_tcp = (peak * b);
-            w_cubic = c * pow(streak - pow(peak * b / c, 1.0 / 3.0), 3) + peak;
+            w_tcp = (peak * alpha);
+            w_cubic = beta * pow(streak - pow(peak * alpha / beta, 1.0 / 3.0), 3) + peak;
             newSize = (long)round(fmin(fmax(fmax(w_tcp, w_cubic),1), global_windowSize - 1));
             reduction_mode = linear;
             params.mdPhases++;
